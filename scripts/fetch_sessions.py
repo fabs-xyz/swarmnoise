@@ -2,12 +2,18 @@
 """
 fetch_sessions.py
 
-Queries the GreyNoise Project Swarm Session API for all sessions observed
-by the configured sensor. Writes session data to data/, a run log to runs/,
-and maintains a rolling 30-day FortiGate-ready threat feed in feeds/.
+Queries the GreyNoise Swarm session API for all sessions observed by the
+configured sensor. Writes session data to data/, a run log to runs/, and
+maintains a rolling 30-day FortiGate-ready threat feed in feeds/.
+
+API endpoint (discovered via browser DevTools at viz.greynoise.io):
+  GET https://viz.greynoise.io/api/greynoise/workspace/sessions
+  Auth header: token: <workspaceApiKey>
 
 Environment variables required:
-  GREYNOISE_API_KEY  — GreyNoise API key
+  GREYNOISE_API_KEY  — workspaceApiKey from viz.greynoise.io (the stable API key,
+                       found in the cookie 'workspaceApiKey' or Settings → API)
+  WORKSPACE_ID       — GreyNoise workspace UUID
   SENSOR_ID          — Swarm sensor UUID
   TIME_WINDOW_START  — ISO8601 UTC start of fetch window (optional,
                        defaults to 6 hours ago, or 30 days on first run)
@@ -25,35 +31,10 @@ from pathlib import Path
 import requests
 
 # ---------------------------------------------------------------------------
-# Configuration
-#
-# The GreyNoise Swarm API is not publicly documented. Endpoint discovery:
-#   1. Log into viz.greynoise.io
-#   2. DevTools → Network → run a Session Explorer search
-#   3. Find the XHR/fetch calls and copy the base URL + path
-#
-# Known auth formats tried:
-#   - "key": <api_key>          (standard GreyNoise API)
-#   - "Authorization": "Bearer <api_key>"   (Swarm API — returns 401 "failed to verify JWT"
-#                                             if the key is not a valid JWT)
-#
-# If GREYNOISE_API_KEY is a standard API key (gn_...) and the Swarm API
-# requires a JWT, you must obtain a JWT from the Swarm auth flow.
-# Check the GreyNoise Swarm settings page for an API token/key option.
+# Configuration — confirmed via browser DevTools at viz.greynoise.io
 # ---------------------------------------------------------------------------
-SWARM_API_BASE = "https://api.greynoise.io"
-SESSIONS_ENDPOINT = f"{SWARM_API_BASE}/v1/workspaces/{{workspace_id}}/sessions/search"
-WORKSPACE_ENDPOINT = f"{SWARM_API_BASE}/v1/workspaces"
-
-# Candidate base URLs to probe if the primary returns 401/404
-# (discovered via DevTools at viz.greynoise.io)
-CANDIDATE_BASES = [
-    "https://api.greynoise.io",
-    "https://swarm.api.greynoise.io",
-    "https://viz.greynoise.io/api",
-]
-
-PAGE_SIZE = 1000
+SESSIONS_URL = "https://viz.greynoise.io/api/greynoise/workspace/sessions"
+PAGE_SIZE = 500          # UI uses 50; increase for efficiency (test if server caps it)
 FEED_RETENTION_DAYS = 30
 
 
@@ -65,154 +46,72 @@ def get_env(name: str) -> str:
     return value
 
 
-def _build_headers(api_key: str, use_bearer: bool = False) -> dict:
-    """Return auth headers. Try Bearer first (Swarm API), fall back to key."""
-    if use_bearer:
-        return {
-            "Authorization": f"Bearer {api_key}",
-            "Accept": "application/json",
-        }
-    return {
-        "key": api_key,
-        "Accept": "application/json",
-    }
-
-
-def get_workspace_id(api_key: str) -> tuple[str, str, bool]:
-    """
-    Fetch the workspace ID associated with the current API key.
-
-    Probes candidate base URLs and both auth header formats.
-    Returns (workspace_id, working_base_url, use_bearer).
-    """
-    for base in CANDIDATE_BASES:
-        endpoint = f"{base}/v1/workspaces"
-        for use_bearer in (False, True):
-            headers = _build_headers(api_key, use_bearer)
-            auth_label = "Bearer" if use_bearer else "key"
-            try:
-                resp = requests.get(endpoint, headers=headers, timeout=30)
-                print(f"  [probe] GET {endpoint} ({auth_label}) → HTTP {resp.status_code}")
-
-                if resp.status_code in (401, 403):
-                    # Wrong auth format or wrong key — try next
-                    snippet = resp.text[:200]
-                    print(f"  [probe] Auth rejected: {snippet}")
-                    continue
-
-                if resp.status_code == 404:
-                    # Wrong base URL — break inner loop, try next base
-                    print(f"  [probe] 404 — base URL not valid")
-                    break
-
-                if not resp.ok:
-                    print(f"  [probe] HTTP {resp.status_code}: {resp.text[:200]}")
-                    continue
-
-                data = resp.json()
-                print(f"  [probe] Response keys: {list(data.keys())}")
-
-                workspaces = data.get("workspaces") or data.get("data") or []
-                if workspaces and isinstance(workspaces, list):
-                    wid = workspaces[0]["id"]
-                    print(f"  [probe] Found workspace ID via {base} ({auth_label}): {wid}")
-                    return wid, base, use_bearer
-                if "id" in data:
-                    wid = data["id"]
-                    print(f"  [probe] Found workspace ID via {base} ({auth_label}): {wid}")
-                    return wid, base, use_bearer
-
-                print(f"  [probe] No workspace ID in response: {json.dumps(data)[:500]}")
-
-            except requests.RequestException as exc:
-                print(f"  [probe] Request error: {exc}")
-
-    print(
-        "[error] Could not resolve workspace ID from any known endpoint.\n"
-        "\n"
-        "  To find the correct API endpoint:\n"
-        "    1. Log into viz.greynoise.io\n"
-        "    2. Open DevTools (F12) → Network tab\n"
-        "    3. Go to Observe → Explore, run any session search\n"
-        "    4. Find the API XHR call, copy the full URL\n"
-        "    5. Update SWARM_API_BASE in scripts/fetch_sessions.py\n"
-        "\n"
-        "  If your API key is a standard GreyNoise key (gn_...) and the\n"
-        "  Swarm API requires a JWT, check the GreyNoise Swarm dashboard\n"
-        "  for a dedicated API token under Settings → API / Integrations.\n",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-
 def fetch_sessions(
     api_key: str,
-    workspace_id: str,
     sensor_id: str,
     window_start: datetime,
     window_end: datetime,
-    base_url: str,
-    use_bearer: bool,
 ) -> list:
-    """Fetch all sessions for the sensor within the time window."""
-    headers = _build_headers(api_key, use_bearer)
+    """
+    Fetch all sessions for the sensor within the time window.
 
-    # All sessions from this sensor — no profile filter needed since the
-    # sensor exclusively runs the Fortinet profile
+    Uses the viz.greynoise.io proxy API with token auth and page-based pagination.
+    """
+    headers = {
+        "token": api_key,
+        "Accept": "application/json",
+        "Referer": "https://viz.greynoise.io/observe/explore/sessions",
+    }
+
+    start_str = window_start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    end_str = window_end.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    # Filter to our sensor only
     query = f"gnMetadata.sensor.id:{sensor_id}"
 
-    endpoint = f"{base_url}/v1/workspaces/{workspace_id}/sessions/search"
-    print(f"  [fetch] Endpoint: POST {endpoint}")
-    print(f"  [fetch] Query: {query}")
-
     sessions = []
-    scroll = None
-    page = 0
+    page = 1
 
     while True:
-        page += 1
-        payload = {
+        params = {
             "query": query,
-            "size": PAGE_SIZE,
-            "start_time": window_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "end_time": window_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "start_time": start_str,
+            "end_time": end_str,
+            "page": page,
+            "page_size": PAGE_SIZE,
+            "sort_by": "lastPacket",
+            "sort_desc": "true",
         }
-        if scroll:
-            payload["scroll"] = scroll
 
         try:
-            resp = requests.post(endpoint, headers=headers, json=payload, timeout=60)
-
+            resp = requests.get(SESSIONS_URL, headers=headers, params=params, timeout=60)
             print(f"  [page {page}] HTTP {resp.status_code}")
 
-            if resp.status_code == 404:
+            if resp.status_code == 401:
                 print(
-                    "[error] Sessions endpoint returned 404.\n"
-                    "        The Swarm session API endpoint URL may differ from what we expect.\n"
-                    "        To find the correct URL:\n"
-                    "          1. Log into viz.greynoise.io\n"
-                    "          2. Open DevTools → Network tab\n"
-                    "          3. Go to Observe → Explore and run a search\n"
-                    "          4. Find the API call and copy the URL\n"
-                    "          5. Update SWARM_API_BASE in this script\n"
-                    f"        Tried: POST {endpoint}\n"
-                    f"        Response body: {resp.text[:500]}",
+                    "[error] Authentication failed (401). The GREYNOISE_API_KEY secret\n"
+                    "        may be expired or incorrect.\n"
+                    "        To refresh: log into viz.greynoise.io, open DevTools → Network,\n"
+                    "        run a session search, and copy the 'token' request header value.\n"
+                    "        Then update the secret:\n"
+                    "          gh secret set GREYNOISE_API_KEY --repo fabs-xyz/swarmnoise\n"
+                    f"        Response: {resp.text[:300]}",
                     file=sys.stderr,
                 )
                 sys.exit(1)
 
-            if resp.status_code == 401:
+            if resp.status_code == 403:
                 print(
-                    "[error] Authentication failed (401). Check your GREYNOISE_API_KEY.\n"
-                    f"        Response body: {resp.text[:500]}",
+                    "[error] Forbidden (403). The token may lack access to this workspace.\n"
+                    f"        Response: {resp.text[:300]}",
                     file=sys.stderr,
                 )
                 sys.exit(1)
 
             if not resp.ok:
                 print(
-                    f"[error] Unexpected HTTP {resp.status_code} on page {page}.\n"
-                    f"        Response body: {resp.text[:1000]}",
+                    f"[error] HTTP {resp.status_code} on page {page}.\n"
+                    f"        Response: {resp.text[:500]}",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -223,23 +122,35 @@ def fetch_sessions(
             print(f"[error] Request failed on page {page}: {exc}", file=sys.stderr)
             sys.exit(1)
 
-        page_sessions = data.get("data") or data.get("sessions") or []
-        sessions.extend(page_sessions)
+        # Print response structure on first page for debugging
+        if page == 1:
+            keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+            print(f"  [page 1] Response keys: {keys}")
 
+        # Extract sessions — handle various response shapes
+        if isinstance(data, list):
+            page_sessions = data
+        elif isinstance(data, dict):
+            page_sessions = (
+                data.get("sessions")
+                or data.get("data")
+                or data.get("results")
+                or []
+            )
+        else:
+            page_sessions = []
+
+        sessions.extend(page_sessions)
         print(f"  [page {page}] {len(page_sessions)} sessions (total: {len(sessions)})")
 
-        # Print response structure on first page to help with debugging
         if page == 1 and not page_sessions:
-            print(f"  [debug] Response keys: {list(data.keys())}")
-            print(f"  [debug] Full response (truncated): {json.dumps(data, indent=2)[:2000]}")
+            print(f"  [debug] Full response (truncated):\n{json.dumps(data, indent=2)[:2000]}")
 
-        # Pagination via scroll token
-        meta = data.get("request_metadata") or data.get("metadata") or {}
-        complete = meta.get("complete", True)
-        scroll = meta.get("scroll")
-
-        if complete or not scroll or not page_sessions:
+        # Pagination: stop when we get fewer results than page_size
+        if len(page_sessions) < PAGE_SIZE:
             break
+
+        page += 1
 
     return sessions
 
@@ -274,34 +185,33 @@ def update_threat_feed(
     now_str = fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
     cutoff = fetch_ts - timedelta(days=FEED_RETENTION_DAYS)
 
-    # Extract source IPs from sessions
+    # Extract source IPs from sessions — try multiple field paths
     new_ips: set[str] = set()
     for session in sessions:
-        # Try multiple possible field paths for source IP
-        ip = (
-            (session.get("source") or {}).get("ip")
-            or session.get("source.ip")
-            or session.get("srcIp")
-            or session.get("src_ip")
-        )
+        ip = None
+        if isinstance(session, dict):
+            ip = (
+                (session.get("source") or {}).get("ip")
+                or session.get("source.ip")
+                or session.get("srcIp")
+                or session.get("src_ip")
+                or session.get("sourceIp")
+            )
         if ip and isinstance(ip, str) and ip.strip():
             new_ips.add(ip.strip())
 
-    print(f"  [feed] {len(new_ips)} unique source IPs extracted from sessions")
+    print(f"  [feed] {len(new_ips)} unique source IPs extracted from {len(sessions)} sessions")
 
-    # Update metadata — set first_seen on new IPs, update last_seen on all
+    # Update metadata
     new_count = 0
     for ip in new_ips:
         if ip not in metadata:
-            metadata[ip] = {
-                "first_seen": now_str,
-                "last_seen": now_str,
-            }
+            metadata[ip] = {"first_seen": now_str, "last_seen": now_str}
             new_count += 1
         else:
             metadata[ip]["last_seen"] = now_str
 
-    # Prune IPs outside the 30-day retention window
+    # Prune IPs outside the retention window
     pruned = [
         ip for ip, meta in metadata.items()
         if datetime.fromisoformat(meta["last_seen"].replace("Z", "+00:00")) < cutoff
@@ -413,6 +323,7 @@ def main() -> None:
     print(f"    Window   : {window_start.strftime('%Y-%m-%dT%H:%M:%SZ')} → "
           f"{window_end.strftime('%Y-%m-%dT%H:%M:%SZ')}")
     print(f"    Bootstrap: {bootstrap}")
+    print(f"    Endpoint : {SESSIONS_URL}")
 
     start_time = time.monotonic()
     error = None
@@ -420,17 +331,10 @@ def main() -> None:
     feed_ip_count = 0
 
     try:
-        print("[*] Resolving workspace ID...")
-        workspace_id, base_url, use_bearer = get_workspace_id(api_key)
-        print(f"    Workspace: {workspace_id}  base: {base_url}  bearer: {use_bearer}")
-
         print("[*] Fetching sessions...")
-        sessions = fetch_sessions(
-            api_key, workspace_id, sensor_id, window_start, window_end,
-            base_url, use_bearer,
-        )
+        sessions = fetch_sessions(api_key, sensor_id, window_start, window_end)
 
-        print(f"[*] Updating threat feed...")
+        print("[*] Updating threat feed...")
         feed_ip_count = update_threat_feed(sessions, repo_root, now)
 
     except SystemExit:
