@@ -26,13 +26,32 @@ import requests
 
 # ---------------------------------------------------------------------------
 # Configuration
-# NOTE: If you get a 404, find the correct endpoint by inspecting the
-# Network tab in browser DevTools while using the Session Explorer UI at
-# viz.greynoise.io → Observe → Explore. Update SWARM_API_BASE accordingly.
+#
+# The GreyNoise Swarm API is not publicly documented. Endpoint discovery:
+#   1. Log into viz.greynoise.io
+#   2. DevTools → Network → run a Session Explorer search
+#   3. Find the XHR/fetch calls and copy the base URL + path
+#
+# Known auth formats tried:
+#   - "key": <api_key>          (standard GreyNoise API)
+#   - "Authorization": "Bearer <api_key>"   (Swarm API — returns 401 "failed to verify JWT"
+#                                             if the key is not a valid JWT)
+#
+# If GREYNOISE_API_KEY is a standard API key (gn_...) and the Swarm API
+# requires a JWT, you must obtain a JWT from the Swarm auth flow.
+# Check the GreyNoise Swarm settings page for an API token/key option.
 # ---------------------------------------------------------------------------
 SWARM_API_BASE = "https://api.greynoise.io"
 SESSIONS_ENDPOINT = f"{SWARM_API_BASE}/v1/workspaces/{{workspace_id}}/sessions/search"
 WORKSPACE_ENDPOINT = f"{SWARM_API_BASE}/v1/workspaces"
+
+# Candidate base URLs to probe if the primary returns 401/404
+# (discovered via DevTools at viz.greynoise.io)
+CANDIDATE_BASES = [
+    "https://api.greynoise.io",
+    "https://swarm.api.greynoise.io",
+    "https://viz.greynoise.io/api",
+]
 
 PAGE_SIZE = 1000
 FEED_RETENTION_DAYS = 30
@@ -46,56 +65,84 @@ def get_env(name: str) -> str:
     return value
 
 
-def get_workspace_id(api_key: str) -> str:
-    """Fetch the workspace ID associated with the current API key."""
-    headers = {
+def _build_headers(api_key: str, use_bearer: bool = False) -> dict:
+    """Return auth headers. Try Bearer first (Swarm API), fall back to key."""
+    if use_bearer:
+        return {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        }
+    return {
         "key": api_key,
         "Accept": "application/json",
     }
-    try:
-        resp = requests.get(WORKSPACE_ENDPOINT, headers=headers, timeout=30)
 
-        print(f"  [workspace] HTTP {resp.status_code}")
 
-        if resp.status_code == 404:
-            print(
-                "[error] Workspace endpoint returned 404. The API endpoint may have changed.\n"
-                "        Check the README for instructions on finding the correct endpoint.\n"
-                f"        Tried: GET {WORKSPACE_ENDPOINT}\n"
-                f"        Response body: {resp.text[:500]}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+def get_workspace_id(api_key: str) -> tuple[str, str, bool]:
+    """
+    Fetch the workspace ID associated with the current API key.
 
-        if resp.status_code == 401:
-            print(
-                "[error] Authentication failed (401). Check your GREYNOISE_API_KEY.\n"
-                f"        Response body: {resp.text[:500]}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+    Probes candidate base URLs and both auth header formats.
+    Returns (workspace_id, working_base_url, use_bearer).
+    """
+    for base in CANDIDATE_BASES:
+        endpoint = f"{base}/v1/workspaces"
+        for use_bearer in (False, True):
+            headers = _build_headers(api_key, use_bearer)
+            auth_label = "Bearer" if use_bearer else "key"
+            try:
+                resp = requests.get(endpoint, headers=headers, timeout=30)
+                print(f"  [probe] GET {endpoint} ({auth_label}) → HTTP {resp.status_code}")
 
-        resp.raise_for_status()
-        data = resp.json()
-        print(f"  [workspace] Response keys: {list(data.keys())}")
+                if resp.status_code in (401, 403):
+                    # Wrong auth format or wrong key — try next
+                    snippet = resp.text[:200]
+                    print(f"  [probe] Auth rejected: {snippet}")
+                    continue
 
-        # Handle different response shapes
-        workspaces = data.get("workspaces") or data.get("data") or []
-        if workspaces and isinstance(workspaces, list):
-            return workspaces[0]["id"]
-        if "id" in data:
-            return data["id"]
+                if resp.status_code == 404:
+                    # Wrong base URL — break inner loop, try next base
+                    print(f"  [probe] 404 — base URL not valid")
+                    break
 
-        print(
-            f"[error] Could not extract workspace ID from response.\n"
-            f"        Full response: {json.dumps(data, indent=2)[:1000]}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+                if not resp.ok:
+                    print(f"  [probe] HTTP {resp.status_code}: {resp.text[:200]}")
+                    continue
 
-    except requests.RequestException as exc:
-        print(f"[error] Failed to fetch workspace: {exc}", file=sys.stderr)
-        sys.exit(1)
+                data = resp.json()
+                print(f"  [probe] Response keys: {list(data.keys())}")
+
+                workspaces = data.get("workspaces") or data.get("data") or []
+                if workspaces and isinstance(workspaces, list):
+                    wid = workspaces[0]["id"]
+                    print(f"  [probe] Found workspace ID via {base} ({auth_label}): {wid}")
+                    return wid, base, use_bearer
+                if "id" in data:
+                    wid = data["id"]
+                    print(f"  [probe] Found workspace ID via {base} ({auth_label}): {wid}")
+                    return wid, base, use_bearer
+
+                print(f"  [probe] No workspace ID in response: {json.dumps(data)[:500]}")
+
+            except requests.RequestException as exc:
+                print(f"  [probe] Request error: {exc}")
+
+    print(
+        "[error] Could not resolve workspace ID from any known endpoint.\n"
+        "\n"
+        "  To find the correct API endpoint:\n"
+        "    1. Log into viz.greynoise.io\n"
+        "    2. Open DevTools (F12) → Network tab\n"
+        "    3. Go to Observe → Explore, run any session search\n"
+        "    4. Find the API XHR call, copy the full URL\n"
+        "    5. Update SWARM_API_BASE in scripts/fetch_sessions.py\n"
+        "\n"
+        "  If your API key is a standard GreyNoise key (gn_...) and the\n"
+        "  Swarm API requires a JWT, check the GreyNoise Swarm dashboard\n"
+        "  for a dedicated API token under Settings → API / Integrations.\n",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def fetch_sessions(
@@ -104,19 +151,17 @@ def fetch_sessions(
     sensor_id: str,
     window_start: datetime,
     window_end: datetime,
+    base_url: str,
+    use_bearer: bool,
 ) -> list:
     """Fetch all sessions for the sensor within the time window."""
-    headers = {
-        "key": api_key,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
+    headers = _build_headers(api_key, use_bearer)
 
     # All sessions from this sensor — no profile filter needed since the
     # sensor exclusively runs the Fortinet profile
     query = f"gnMetadata.sensor.id:{sensor_id}"
 
-    endpoint = SESSIONS_ENDPOINT.format(workspace_id=workspace_id)
+    endpoint = f"{base_url}/v1/workspaces/{workspace_id}/sessions/search"
     print(f"  [fetch] Endpoint: POST {endpoint}")
     print(f"  [fetch] Query: {query}")
 
@@ -376,12 +421,13 @@ def main() -> None:
 
     try:
         print("[*] Resolving workspace ID...")
-        workspace_id = get_workspace_id(api_key)
-        print(f"    Workspace: {workspace_id}")
+        workspace_id, base_url, use_bearer = get_workspace_id(api_key)
+        print(f"    Workspace: {workspace_id}  base: {base_url}  bearer: {use_bearer}")
 
         print("[*] Fetching sessions...")
         sessions = fetch_sessions(
-            api_key, workspace_id, sensor_id, window_start, window_end
+            api_key, workspace_id, sensor_id, window_start, window_end,
+            base_url, use_bearer,
         )
 
         print(f"[*] Updating threat feed...")
