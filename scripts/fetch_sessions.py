@@ -2,23 +2,17 @@
 """
 fetch_sessions.py
 
-Queries the GreyNoise Swarm session API for all sessions observed by the
-configured sensor. Writes session data to data/, a run log to runs/, and
-maintains a rolling 30-day FortiGate-ready threat feed in feeds/.
+Queries the GreyNoise Swarm sensor activity via the official API:
+  GET https://api.greynoise.io/v1/workspaces/{workspace_id}/sensors/activity
+  Auth: key: <GREYNOISE_API_KEY>
 
-API endpoint (discovered via browser DevTools at viz.greynoise.io):
-  GET https://viz.greynoise.io/api/greynoise/workspace/sessions
-  Auth header: token: <workspaceApiKey>
+Writes session data to data/, a run log to runs/, and maintains a rolling
+30-day FortiGate-ready threat feed in feeds/fortinet_ips.txt.
 
 Environment variables required:
-  GREYNOISE_API_KEY  — workspaceApiKey from viz.greynoise.io (the stable API key,
-                       found in the cookie 'workspaceApiKey' or Settings → API)
+  GREYNOISE_API_KEY  — GreyNoise API key (from viz.greynoise.io Settings → API)
   WORKSPACE_ID       — GreyNoise workspace UUID
-  SENSOR_ID          — Swarm sensor UUID
-  TIME_WINDOW_START  — ISO8601 UTC start of fetch window (optional,
-                       defaults to 6 hours ago, or 30 days on first run)
-  TIME_WINDOW_END    — ISO8601 UTC end of fetch window (optional,
-                       defaults to now)
+  SENSOR_ID          — Swarm sensor UUID (used for logging/filtering only)
 """
 
 import json
@@ -31,13 +25,11 @@ from pathlib import Path
 import requests
 
 # ---------------------------------------------------------------------------
-# Configuration — confirmed via browser DevTools at viz.greynoise.io
+# Configuration
 # ---------------------------------------------------------------------------
-SESSIONS_URL = "https://viz.greynoise.io/api/greynoise/workspace/sessions"
-# Workspace ID — from cookie activeWorkspace / stigg-entitlements in browser session
-# Passed as query param workspace_id to identify the active workspace without a session cookie
-PAGE_SIZE = 500          # UI uses 50; increase for efficiency (test if server caps it)
-FEED_RETENTION_DAYS = 30
+API_BASE             = "https://api.greynoise.io"
+PAGE_SIZE            = 1000
+FEED_RETENTION_DAYS  = 30
 
 
 def get_env(name: str) -> str:
@@ -51,54 +43,46 @@ def get_env(name: str) -> str:
 def fetch_sessions(
     api_key: str,
     workspace_id: str,
-    sensor_id: str,
     window_start: datetime,
     window_end: datetime,
 ) -> list:
     """
-    Fetch all sessions for the sensor within the time window.
+    Fetch all sessions for the workspace within the time window.
 
-    Uses the viz.greynoise.io proxy API with token auth and page-based pagination.
+    Uses api.greynoise.io/v1/workspaces/{workspace_id}/sensors/activity
+    with standard key: header auth and scroll-based pagination.
     """
+    url = f"{API_BASE}/v1/workspaces/{workspace_id}/sensors/activity"
     headers = {
-        "token": api_key,
+        "key": api_key,
         "Accept": "application/json",
-        "Referer": "https://viz.greynoise.io/observe/explore/sessions",
     }
 
-    start_str = window_start.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    end_str = window_end.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-    # Filter to our sensor only
-    query = f"gnMetadata.sensor.id:{sensor_id}"
+    start_str = window_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str   = window_end.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     sessions = []
-    page = 1
+    page     = 1
+    scroll   = None
 
     while True:
-        params = {
-            "query": query,
+        params: dict = {
+            "format":     "json",
             "start_time": start_str,
-            "end_time": end_str,
-            "page": page,
-            "page_size": PAGE_SIZE,
-            "sort_by": "lastPacket",
-            "sort_desc": "true",
-            "workspace_id": workspace_id,
+            "end_time":   end_str,
+            "size":       PAGE_SIZE,
         }
+        if scroll:
+            params["scroll"] = scroll
 
         try:
-            resp = requests.get(SESSIONS_URL, headers=headers, params=params, timeout=60)
+            resp = requests.get(url, headers=headers, params=params, timeout=60)
             print(f"  [page {page}] HTTP {resp.status_code}")
 
             if resp.status_code == 401:
                 print(
-                    "[error] Authentication failed (401). The GREYNOISE_API_KEY secret\n"
-                    "        may be expired or incorrect.\n"
-                    "        To refresh: log into viz.greynoise.io, open DevTools → Network,\n"
-                    "        run a session search, and copy the 'token' request header value.\n"
-                    "        Then update the secret:\n"
-                    "          gh secret set GREYNOISE_API_KEY --repo fabs-xyz/swarmnoise\n"
+                    "[error] 401 Unauthorized — GREYNOISE_API_KEY is invalid or expired.\n"
+                    "        Refresh it at: viz.greynoise.io → Settings → API Key\n"
                     f"        Response: {resp.text[:300]}",
                     file=sys.stderr,
                 )
@@ -106,7 +90,15 @@ def fetch_sessions(
 
             if resp.status_code == 403:
                 print(
-                    "[error] Forbidden (403). The token may lack access to this workspace.\n"
+                    f"[error] 403 Forbidden — API key lacks access to workspace {workspace_id}.\n"
+                    f"        Response: {resp.text[:300]}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            if resp.status_code == 404:
+                print(
+                    f"[error] 404 Not Found — workspace {workspace_id} does not exist or is inaccessible.\n"
                     f"        Response: {resp.text[:300]}",
                     file=sys.stderr,
                 )
@@ -128,21 +120,39 @@ def fetch_sessions(
 
         # Print response structure on first page for debugging
         if page == 1:
-            keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
-            print(f"  [page 1] Response keys: {keys}")
+            if isinstance(data, dict):
+                print(f"  [page 1] Response keys: {list(data.keys())}")
+            elif isinstance(data, list):
+                print(f"  [page 1] Response: list of {len(data)} items")
+                if data:
+                    print(f"  [page 1] First item keys: {list(data[0].keys()) if isinstance(data[0], dict) else type(data[0])}")
+            else:
+                print(f"  [page 1] Unexpected response type: {type(data)}")
 
-        # Extract sessions — handle various response shapes
+        # Extract sessions — API returns a list directly or wrapped in a dict
         if isinstance(data, list):
             page_sessions = data
+            # Scroll token may come from response headers
+            scroll = resp.headers.get("X-Scroll") or resp.headers.get("scroll") or None
         elif isinstance(data, dict):
             page_sessions = (
-                data.get("sessions")
-                or data.get("data")
+                data.get("data")
+                or data.get("sessions")
+                or data.get("items")
                 or data.get("results")
                 or []
             )
+            # Scroll token may be in body or headers
+            scroll = (
+                data.get("scroll")
+                or data.get("next_scroll")
+                or resp.headers.get("X-Scroll")
+                or resp.headers.get("scroll")
+                or None
+            )
         else:
             page_sessions = []
+            scroll = None
 
         sessions.extend(page_sessions)
         print(f"  [page {page}] {len(page_sessions)} sessions (total: {len(sessions)})")
@@ -150,8 +160,8 @@ def fetch_sessions(
         if page == 1 and not page_sessions:
             print(f"  [debug] Full response (truncated):\n{json.dumps(data, indent=2)[:2000]}")
 
-        # Pagination: stop when we get fewer results than page_size
-        if len(page_sessions) < PAGE_SIZE:
+        # Stop when page is under full size, or no scroll token
+        if len(page_sessions) < PAGE_SIZE or not scroll:
             break
 
         page += 1
@@ -176,7 +186,7 @@ def update_threat_feed(
     feeds_dir.mkdir(exist_ok=True)
 
     metadata_path = feeds_dir / "ip_metadata.json"
-    feed_path = feeds_dir / "fortinet_ips.txt"
+    feed_path     = feeds_dir / "fortinet_ips.txt"
 
     # Load existing metadata
     metadata: dict = {}
@@ -187,20 +197,21 @@ def update_threat_feed(
             metadata = {}
 
     now_str = fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
-    cutoff = fetch_ts - timedelta(days=FEED_RETENTION_DAYS)
+    cutoff  = fetch_ts - timedelta(days=FEED_RETENTION_DAYS)
 
-    # Extract source IPs from sessions — try multiple field paths
-    new_ips: set[str] = set()
+    # Extract source IPs — SDK confirms field is "source_ip"
+    new_ips: set = set()
     for session in sessions:
-        ip = None
-        if isinstance(session, dict):
-            ip = (
-                (session.get("source") or {}).get("ip")
-                or session.get("source.ip")
-                or session.get("srcIp")
-                or session.get("src_ip")
-                or session.get("sourceIp")
-            )
+        if not isinstance(session, dict):
+            continue
+        ip = (
+            session.get("source_ip")
+            or (session.get("source") or {}).get("ip")
+            or session.get("source.ip")
+            or session.get("srcIp")
+            or session.get("src_ip")
+            or session.get("sourceIp")
+        )
         if ip and isinstance(ip, str) and ip.strip():
             new_ips.add(ip.strip())
 
@@ -243,6 +254,7 @@ def update_threat_feed(
 def write_outputs(
     sessions: list,
     sensor_id: str,
+    workspace_id: str,
     window_start: datetime,
     window_end: datetime,
     fetch_ts: datetime,
@@ -251,7 +263,7 @@ def write_outputs(
     feed_ip_count: int,
 ) -> None:
     """Write session data file (if sessions found) and run log (always)."""
-    ts_str = fetch_ts.strftime("%Y-%m-%d_%H%M")
+    ts_str    = fetch_ts.strftime("%Y-%m-%d_%H%M")
     repo_root = Path(__file__).parent.parent
 
     data_dir = repo_root / "data"
@@ -261,14 +273,15 @@ def write_outputs(
 
     # Run log — always written
     run_log = {
-        "timestamp": fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "sensor_id": sensor_id,
+        "timestamp":        fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "sensor_id":        sensor_id,
+        "workspace_id":     workspace_id,
         "time_window_start": window_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "time_window_end": window_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "sessions_found": len(sessions),
-        "feed_ip_count": feed_ip_count,
+        "time_window_end":  window_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "sessions_found":   len(sessions),
+        "feed_ip_count":    feed_ip_count,
         "duration_seconds": round(duration, 2),
-        "error": error,
+        "error":            error,
     }
     run_log_path = runs_dir / f"{ts_str}_run_log.json"
     run_log_path.write_text(json.dumps(run_log, indent=2))
@@ -277,12 +290,13 @@ def write_outputs(
     # Session data — only if we have sessions
     if sessions:
         data_payload = {
-            "fetch_timestamp": fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "sensor_id": sensor_id,
+            "fetch_timestamp":  fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "sensor_id":        sensor_id,
+            "workspace_id":     workspace_id,
             "time_window_start": window_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "time_window_end": window_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "session_count": len(sessions),
-            "sessions": sessions,
+            "time_window_end":  window_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "session_count":    len(sessions),
+            "sessions":         sessions,
         }
         data_path = data_dir / f"{ts_str}.json"
         data_path.write_text(json.dumps(data_payload, indent=2))
@@ -297,47 +311,46 @@ def is_first_run(repo_root: Path) -> bool:
 
 
 def main() -> None:
-    api_key = get_env("GREYNOISE_API_KEY")
+    api_key      = get_env("GREYNOISE_API_KEY")
     workspace_id = get_env("WORKSPACE_ID")
-    sensor_id = get_env("SENSOR_ID")
+    sensor_id    = get_env("SENSOR_ID")
 
-    now = datetime.now(timezone.utc)
+    now       = datetime.now(timezone.utc)
     repo_root = Path(__file__).parent.parent
 
     # Determine time window
-    # On first run (no ip_metadata.json): fetch last 30 days to bootstrap the feed
-    # Otherwise: use env vars from scheduler, or default to last 6 hours
     window_start_str = os.environ.get("TIME_WINDOW_START")
-    window_end_str = os.environ.get("TIME_WINDOW_END")
+    window_end_str   = os.environ.get("TIME_WINDOW_END")
 
     bootstrap = is_first_run(repo_root)
 
     if bootstrap:
         print("[*] First run detected — bootstrapping feed with last 30 days of data")
-        window_end = now
+        window_end   = now
         window_start = now - timedelta(days=30)
     elif window_start_str and window_end_str:
         window_start = datetime.fromisoformat(window_start_str.replace("Z", "+00:00"))
-        window_end = datetime.fromisoformat(window_end_str.replace("Z", "+00:00"))
+        window_end   = datetime.fromisoformat(window_end_str.replace("Z", "+00:00"))
     else:
-        window_end = now
+        window_end   = now
         window_start = now - timedelta(hours=6)
 
-    print(f"[*] GreyNoise Swarm — session fetch")
-    print(f"    Sensor   : {sensor_id}")
-    print(f"    Window   : {window_start.strftime('%Y-%m-%dT%H:%M:%SZ')} → "
+    print(f"[*] GreyNoise Swarm — sensor activity fetch")
+    print(f"    Sensor    : {sensor_id}")
+    print(f"    Workspace : {workspace_id}")
+    print(f"    Window    : {window_start.strftime('%Y-%m-%dT%H:%M:%SZ')} → "
           f"{window_end.strftime('%Y-%m-%dT%H:%M:%SZ')}")
-    print(f"    Bootstrap: {bootstrap}")
-    print(f"    Endpoint : {SESSIONS_URL}")
+    print(f"    Bootstrap : {bootstrap}")
+    print(f"    Endpoint  : {API_BASE}/v1/workspaces/{{workspace_id}}/sensors/activity")
 
-    start_time = time.monotonic()
+    t0    = time.monotonic()
     error = None
-    sessions = []
+    sessions     = []
     feed_ip_count = 0
 
     try:
         print("[*] Fetching sessions...")
-        sessions = fetch_sessions(api_key, workspace_id, sensor_id, window_start, window_end)
+        sessions = fetch_sessions(api_key, workspace_id, window_start, window_end)
 
         print("[*] Updating threat feed...")
         feed_ip_count = update_threat_feed(sessions, repo_root, now)
@@ -350,9 +363,11 @@ def main() -> None:
         import traceback
         traceback.print_exc()
 
-    duration = time.monotonic() - start_time
+    duration = time.monotonic() - t0
     write_outputs(
-        sessions, sensor_id, window_start, window_end, now, duration, error, feed_ip_count
+        sessions, sensor_id, workspace_id,
+        window_start, window_end, now,
+        duration, error, feed_ip_count,
     )
 
     print(f"[*] Done in {duration:.1f}s — {len(sessions)} sessions, "
