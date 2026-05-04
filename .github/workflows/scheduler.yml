@@ -151,7 +151,7 @@ jobs:
           git config user.name  "swarmnoise-bot"
           git config user.email "swarmnoise-bot@users.noreply.github.com"
 
-          git add data/ runs/ state/
+          git add data/ runs/ state/ feeds/
 
           if git diff --staged --quiet; then
             echo "Nothing to commit."
@@ -175,10 +175,19 @@ jobs:
           else:
               print(0)
           ")
+            FEED_IP_COUNT=$(python3 -c "
+          import json, glob
+          logs = sorted(glob.glob('runs/*_run_log.json'))
+          if logs:
+              d = json.loads(open(logs[-1]).read())
+              print(d.get('feed_ip_count', 0))
+          else:
+              print(0)
+          ")
             if [ "$SESSION_COUNT" -gt 0 ]; then
-              MSG="data: ${TIMESTAMP} — ${SESSION_COUNT} Fortinet sessions (run $((COMPLETED+1))/${TARGET})"
-            else:
-              MSG="run log: ${TIMESTAMP} — no sessions found (run $((COMPLETED+1))/${TARGET})"
+              MSG="data: ${TIMESTAMP} — ${SESSION_COUNT} sessions, ${FEED_IP_COUNT} IPs in feed (run $((COMPLETED+1))/${TARGET})"
+            else
+              MSG="run log: ${TIMESTAMP} — no sessions found, ${FEED_IP_COUNT} IPs in feed (run $((COMPLETED+1))/${TARGET})"
             fi
           else
             MSG="state: ${TIMESTAMP} — daily schedule initialized (${TARGET} runs planned)"
