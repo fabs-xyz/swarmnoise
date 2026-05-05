@@ -77,6 +77,11 @@ def _fetch_page(
                 file=sys.stderr,
             )
             sys.exit(1)
+        if resp.status_code in (429, 500, 502, 503, 504):
+            # Transient / rate-limit error — signal to caller for retry
+            raise requests.HTTPError(
+                f"HTTP {resp.status_code}: {resp.text[:200]}", response=resp
+            )
         if not resp.ok:
             print(
                 f"[error] HTTP {resp.status_code} on page {page_num}.\n"
@@ -87,6 +92,8 @@ def _fetch_page(
 
         data = resp.json()
 
+    except requests.HTTPError:
+        raise
     except requests.RequestException as exc:
         print(f"[error] Request failed on page {page_num}: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -192,6 +199,7 @@ def fetch_sessions(
         print(f"  [chunk {chunk_num}] {len(chunk_sessions)} sessions "
               f"(running total: {len(all_sessions)})")
         chunk_start = chunk_end
+        time.sleep(0.5)  # avoid rate-limit 500s
 
     return all_sessions
 
@@ -228,7 +236,27 @@ def _fetch_window_scrolled(
             extra_headers["X-Scroll-Id"] = scroll
 
         merged_headers = {**req_headers, **extra_headers}
-        page_sessions, scroll, _ = _fetch_page(url, merged_headers, params, page)
+
+        # Retry transient errors (429/5xx) up to 3 times with backoff
+        for attempt in range(1, 4):
+            try:
+                page_sessions, scroll, _ = _fetch_page(url, merged_headers, params, page)
+                break
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else 0
+                if attempt < 3:
+                    wait = 5 * attempt
+                    print(f"    [retry] HTTP {status} on attempt {attempt} — "
+                          f"waiting {wait}s before retry")
+                    time.sleep(wait)
+                else:
+                    print(
+                        f"[error] HTTP {status} after 3 attempts — giving up on this chunk.\n"
+                        f"        {exc}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+
         sessions.extend(page_sessions)
         print(f"    [scroll page {page}] {len(page_sessions)} sessions "
               f"(window total: {len(sessions)}, scroll: {'yes' if scroll else 'no'})")
