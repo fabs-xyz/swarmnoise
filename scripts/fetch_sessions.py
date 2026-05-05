@@ -134,7 +134,8 @@ def _fetch_page(
         # Check response headers (case-insensitive)
         h = {k.lower(): v for k, v in resp.headers.items()}
         scroll = (
-            h.get("x-scroll")
+            h.get("x-scroll-id")
+            or h.get("x-scroll")
             or h.get("scroll")
             or h.get("x-cursor")
             or h.get("cursor")
