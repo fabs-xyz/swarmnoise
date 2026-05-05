@@ -434,7 +434,9 @@ def main() -> None:
     if bootstrap:
         print("[*] First run detected — bootstrapping feed with last 30 days of data")
         window_end   = now
-        window_start = now - timedelta(days=30)
+        # Start slightly inside the 30-day limit to avoid API boundary errors.
+        # The API rejects requests where start_time is exactly 30 days ago.
+        window_start = now - timedelta(days=29, hours=23)
     elif window_start_str and window_end_str:
         window_start = datetime.fromisoformat(window_start_str.replace("Z", "+00:00"))
         window_end   = datetime.fromisoformat(window_end_str.replace("Z", "+00:00"))
