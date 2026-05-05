@@ -75,12 +75,17 @@ jobs:
 
               print(f"New day — scheduled {target_runs} runs at hours: {scheduled_hours}")
 
+          # workflow_dispatch always fetches (bypass schedule gate)
+          is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+
           # Check if the current hour is a scheduled run that hasn't been done yet
-          should_fetch = (
+          should_fetch = is_manual or (
               current_hour in state.get("scheduled_hours", [])
               and current_hour not in state.get("completed_hours", [])
               and state.get("completed_runs", 0) < state.get("target_runs", 0)
           )
+          if is_manual:
+              print("Manual dispatch — bypassing schedule gate, fetch forced")
 
           # Determine time window for the fetch
           # Use last_fetch_end as start if available, otherwise 6 hours ago
