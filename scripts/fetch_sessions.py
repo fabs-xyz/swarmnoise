@@ -168,13 +168,12 @@ def fetch_sessions(
     }
 
     total_duration = (window_end - window_start).total_seconds()
-    # Use time-chunking when the window is longer than CHUNK_HOURS.
-    # CHUNK_HOURS is set to 1 so each chunk stays well below the 1000-session
-    # API cap (~110 sessions/hour observed), avoiding scroll token pagination
-    # entirely. The X-Scroll-Id token returned by the API is too large (~8 KB)
-    # to pass back as a query parameter (causes HTTP 414 URI Too Long).
-    CHUNK_HOURS      = 1
-    MAX_SCROLL_PAGES = 5  # safety net only; should never be needed with 1h chunks
+    # X-Scroll-Id tokens from this API are ~8KB of base64 — too large to pass
+    # as a query parameter (causes HTTP 414 URI Too Long). We attempt to pass
+    # the token back as the X-Scroll-Id request header instead. For the
+    # bootstrap 30-day window we use 6-hour chunks as a fallback safety net.
+    CHUNK_HOURS      = 6
+    MAX_SCROLL_PAGES = 20
 
     # For short windows (≤ CHUNK_HOURS), use a single scroll-paginated call
     if total_duration <= CHUNK_HOURS * 3600:
@@ -231,10 +230,16 @@ def _fetch_window_scrolled(
             "end_time":   end_str,
             "size":       PAGE_SIZE,
         }
+        # Pass scroll token as a request header, NOT as a query param.
+        # The X-Scroll-Id value is ~8KB of base64 and causes HTTP 414 when
+        # URL-encoded in the query string. The API echoes it via the header
+        # so we mirror it back the same way.
+        extra_headers = {}
         if scroll:
-            params["scroll"] = scroll
+            extra_headers["X-Scroll-Id"] = scroll
 
-        page_sessions, scroll, _ = _fetch_page(url, req_headers, params, page)
+        merged_headers = {**req_headers, **extra_headers}
+        page_sessions, scroll, _ = _fetch_page(url, merged_headers, params, page)
         sessions.extend(page_sessions)
         print(f"    [scroll page {page}] {len(page_sessions)} sessions "
               f"(window total: {len(sessions)}, scroll: {'yes' if scroll else 'no'})")
