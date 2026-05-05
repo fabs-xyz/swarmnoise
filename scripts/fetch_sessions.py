@@ -168,10 +168,13 @@ def fetch_sessions(
     }
 
     total_duration = (window_end - window_start).total_seconds()
-    # Use time-chunking when the window is longer than CHUNK_HOURS
-    # to avoid hitting the per-request result cap
-    CHUNK_HOURS     = 6
-    MAX_SCROLL_PAGES = 20
+    # Use time-chunking when the window is longer than CHUNK_HOURS.
+    # CHUNK_HOURS is set to 1 so each chunk stays well below the 1000-session
+    # API cap (~110 sessions/hour observed), avoiding scroll token pagination
+    # entirely. The X-Scroll-Id token returned by the API is too large (~8 KB)
+    # to pass back as a query parameter (causes HTTP 414 URI Too Long).
+    CHUNK_HOURS      = 1
+    MAX_SCROLL_PAGES = 5  # safety net only; should never be needed with 1h chunks
 
     # For short windows (≤ CHUNK_HOURS), use a single scroll-paginated call
     if total_duration <= CHUNK_HOURS * 3600:
