@@ -40,6 +40,110 @@ def get_env(name: str) -> str:
     return value
 
 
+def _fetch_page(
+    url: str,
+    headers: dict,
+    params: dict,
+    page_num: int,
+) -> tuple:
+    """
+    Fetch one page from the sensor activity API.
+    Returns (sessions_list, scroll_token_or_None, raw_response_headers).
+    Exits on HTTP errors.
+    """
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
+        print(f"  [page {page_num}] HTTP {resp.status_code}")
+
+        if resp.status_code == 401:
+            print(
+                "[error] 401 Unauthorized — GREYNOISE_API_KEY is invalid or expired.\n"
+                "        Refresh it at: viz.greynoise.io → Settings → API Key\n"
+                f"        Response: {resp.text[:300]}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if resp.status_code == 403:
+            print(
+                f"[error] 403 Forbidden — API key lacks access to workspace.\n"
+                f"        Response: {resp.text[:300]}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if resp.status_code == 404:
+            print(
+                f"[error] 404 Not Found — workspace not found or inaccessible.\n"
+                f"        Response: {resp.text[:300]}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not resp.ok:
+            print(
+                f"[error] HTTP {resp.status_code} on page {page_num}.\n"
+                f"        Response: {resp.text[:500]}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        data = resp.json()
+
+    except requests.RequestException as exc:
+        print(f"[error] Request failed on page {page_num}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # Debug: print response structure + ALL headers on first page
+    if page_num == 1:
+        if isinstance(data, dict):
+            print(f"  [debug] Response keys: {list(data.keys())}")
+        elif isinstance(data, list):
+            print(f"  [debug] Response: list of {len(data)} items")
+            if data:
+                print(f"  [debug] First item keys: {list(data[0].keys()) if isinstance(data[0], dict) else type(data[0])}")
+        # Print all response headers so we can identify the scroll token header name
+        print(f"  [debug] Response headers: {dict(resp.headers)}")
+
+    # Extract sessions
+    if isinstance(data, list):
+        page_sessions = data
+    elif isinstance(data, dict):
+        page_sessions = (
+            data.get("data")
+            or data.get("sessions")
+            or data.get("items")
+            or data.get("results")
+            or []
+        )
+    else:
+        page_sessions = []
+
+    if page_num == 1 and not page_sessions:
+        print(f"  [debug] Full response body (truncated):\n{json.dumps(data, indent=2)[:2000]}")
+
+    # Extract scroll token — check every plausible location
+    scroll = None
+    if isinstance(data, dict):
+        scroll = (
+            data.get("scroll")
+            or data.get("next_scroll")
+            or data.get("scrollToken")
+            or data.get("cursor")
+            or data.get("next_cursor")
+            or data.get("nextCursor")
+        )
+    if not scroll:
+        # Check response headers (case-insensitive)
+        h = {k.lower(): v for k, v in resp.headers.items()}
+        scroll = (
+            h.get("x-scroll")
+            or h.get("scroll")
+            or h.get("x-cursor")
+            or h.get("cursor")
+            or h.get("x-next-scroll")
+        )
+
+    return page_sessions, scroll, dict(resp.headers)
+
+
 def fetch_sessions(
     api_key: str,
     workspace_id: str,
@@ -49,15 +153,66 @@ def fetch_sessions(
     """
     Fetch all sessions for the workspace within the time window.
 
-    Uses api.greynoise.io/v1/workspaces/{workspace_id}/sensors/activity
-    with standard key: header auth and scroll-based pagination.
+    Strategy:
+    1. Try scroll-based pagination first (up to MAX_SCROLL_PAGES pages).
+    2. If the API caps at 1000 and returns no scroll token, fall back to
+       time-chunking: split the window into CHUNK_HOURS-hour slices and
+       fetch each independently. This guarantees full coverage regardless
+       of whether the API exposes a scroll mechanism.
     """
     url = f"{API_BASE}/v1/workspaces/{workspace_id}/sensors/activity"
-    headers = {
+    req_headers = {
         "key": api_key,
         "Accept": "application/json",
     }
 
+    total_duration = (window_end - window_start).total_seconds()
+    # Use time-chunking when the window is longer than CHUNK_HOURS
+    # to avoid hitting the per-request result cap
+    CHUNK_HOURS     = 6
+    MAX_SCROLL_PAGES = 20
+
+    # For short windows (≤ CHUNK_HOURS), use a single scroll-paginated call
+    if total_duration <= CHUNK_HOURS * 3600:
+        return _fetch_window_scrolled(
+            url, req_headers, workspace_id,
+            window_start, window_end,
+            MAX_SCROLL_PAGES,
+        )
+
+    # For long windows, chunk by time
+    print(f"  [fetch] Window > {CHUNK_HOURS}h — using time-chunked fetching")
+    all_sessions = []
+    chunk_start = window_start
+    chunk_num   = 0
+
+    while chunk_start < window_end:
+        chunk_end = min(chunk_start + timedelta(hours=CHUNK_HOURS), window_end)
+        chunk_num += 1
+        print(f"  [chunk {chunk_num}] {chunk_start.strftime('%Y-%m-%dT%H:%MZ')} → "
+              f"{chunk_end.strftime('%Y-%m-%dT%H:%MZ')}")
+        chunk_sessions = _fetch_window_scrolled(
+            url, req_headers, workspace_id,
+            chunk_start, chunk_end,
+            MAX_SCROLL_PAGES,
+        )
+        all_sessions.extend(chunk_sessions)
+        print(f"  [chunk {chunk_num}] {len(chunk_sessions)} sessions "
+              f"(running total: {len(all_sessions)})")
+        chunk_start = chunk_end
+
+    return all_sessions
+
+
+def _fetch_window_scrolled(
+    url: str,
+    req_headers: dict,
+    workspace_id: str,  # kept for symmetry / future use
+    window_start: datetime,
+    window_end: datetime,
+    max_pages: int,
+) -> list:
+    """Fetch a single time window with scroll pagination."""
     start_str = window_start.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_str   = window_end.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -75,95 +230,16 @@ def fetch_sessions(
         if scroll:
             params["scroll"] = scroll
 
-        try:
-            resp = requests.get(url, headers=headers, params=params, timeout=60)
-            print(f"  [page {page}] HTTP {resp.status_code}")
-
-            if resp.status_code == 401:
-                print(
-                    "[error] 401 Unauthorized — GREYNOISE_API_KEY is invalid or expired.\n"
-                    "        Refresh it at: viz.greynoise.io → Settings → API Key\n"
-                    f"        Response: {resp.text[:300]}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-
-            if resp.status_code == 403:
-                print(
-                    f"[error] 403 Forbidden — API key lacks access to workspace {workspace_id}.\n"
-                    f"        Response: {resp.text[:300]}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-
-            if resp.status_code == 404:
-                print(
-                    f"[error] 404 Not Found — workspace {workspace_id} does not exist or is inaccessible.\n"
-                    f"        Response: {resp.text[:300]}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-
-            if not resp.ok:
-                print(
-                    f"[error] HTTP {resp.status_code} on page {page}.\n"
-                    f"        Response: {resp.text[:500]}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-
-            data = resp.json()
-
-        except requests.RequestException as exc:
-            print(f"[error] Request failed on page {page}: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-        # Print response structure on first page for debugging
-        if page == 1:
-            if isinstance(data, dict):
-                print(f"  [page 1] Response keys: {list(data.keys())}")
-            elif isinstance(data, list):
-                print(f"  [page 1] Response: list of {len(data)} items")
-                if data:
-                    print(f"  [page 1] First item keys: {list(data[0].keys()) if isinstance(data[0], dict) else type(data[0])}")
-            else:
-                print(f"  [page 1] Unexpected response type: {type(data)}")
-
-        # Extract sessions — API returns a list directly or wrapped in a dict
-        if isinstance(data, list):
-            page_sessions = data
-            # Scroll token may come from response headers
-            scroll = resp.headers.get("X-Scroll") or resp.headers.get("scroll") or None
-        elif isinstance(data, dict):
-            page_sessions = (
-                data.get("data")
-                or data.get("sessions")
-                or data.get("items")
-                or data.get("results")
-                or []
-            )
-            # Scroll token may be in body or headers
-            scroll = (
-                data.get("scroll")
-                or data.get("next_scroll")
-                or resp.headers.get("X-Scroll")
-                or resp.headers.get("scroll")
-                or None
-            )
-        else:
-            page_sessions = []
-            scroll = None
-
+        page_sessions, scroll, _ = _fetch_page(url, req_headers, params, page)
         sessions.extend(page_sessions)
-        print(f"  [page {page}] {len(page_sessions)} sessions (total: {len(sessions)})")
+        print(f"    [scroll page {page}] {len(page_sessions)} sessions "
+              f"(window total: {len(sessions)}, scroll: {'yes' if scroll else 'no'})")
 
-        if page == 1 and not page_sessions:
-            print(f"  [debug] Full response (truncated):\n{json.dumps(data, indent=2)[:2000]}")
-
-        # Stop when page is under full size, or no scroll token
-        if len(page_sessions) < PAGE_SIZE or not scroll:
+        if len(page_sessions) < PAGE_SIZE or not scroll or page >= max_pages:
+            if page >= max_pages and scroll:
+                print(f"    [scroll] Reached max_pages={max_pages} limit — "
+                      f"time-chunker will cover remaining data via smaller windows")
             break
-
         page += 1
 
     return sessions
