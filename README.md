@@ -4,16 +4,28 @@ Automated collector for GreyNoise Project Swarm sensor data, scoped to Fortinet-
 
 Produces a plain-text IP feed compatible with **FortiGate External Threat Feed** (and any other firewall that consumes a newline-separated IP blocklist over HTTPS).
 
-## Threat feed
+## Threat feeds
+
+### Full feed
 
 ```
 https://raw.githubusercontent.com/fabs-xyz/swarmnoise/main/feeds/fortinet_ips.txt
 ```
 
+All source IPs observed attacking the sensor in the last 30 days. Best coverage, slightly higher false-positive risk.
+
+### Filtered feed
+
+```
+https://raw.githubusercontent.com/fabs-xyz/swarmnoise/main/feeds/fortinet_ips_filtered.txt
+```
+
+Subset of the full feed where the IP is classified **malicious** or **suspicious** by the [GreyNoise Community API](https://www.greynoise.io/). IPs not present in the GreyNoise dataset (`unknown`) are excluded. Lower false-positive risk; smaller list.
+
+Both feeds:
 - One IP per line, no comments, no headers
 - Rolling 30-day window — IPs not seen in 30 days are pruned automatically
 - Updated 1–10 times per day at randomised times
-- Currently ~1,300+ unique attacker IPs
 
 ### FortiGate setup
 
@@ -26,7 +38,9 @@ https://raw.githubusercontent.com/fabs-xyz/swarmnoise/main/feeds/fortinet_ips.tx
 | HTTP basic auth | off |
 | Refresh rate | 60 min |
 
-Then reference `swarmnoise-fortinet` in a firewall policy with action **Deny** or in an IPS sensor.
+For the lower false-positive filtered feed, use `fortinet_ips_filtered.txt` as the URI instead.
+
+Then reference the connector in a firewall policy with action **Deny** or in an IPS sensor.
 
 ## How it works
 
@@ -55,16 +69,20 @@ Instead, each fetch window is split into **30-minute chunks**. At the observed s
 ```
 swarmnoise/
 ├── .github/workflows/
-│   └── scheduler.yml          # Hourly trigger, randomised schedule logic + fetch
+│   ├── scheduler.yml              # Hourly trigger, randomised schedule logic + fetch
+│   └── enrich.yml                 # Manual one-shot IP classification enrichment
 ├── scripts/
-│   └── fetch_sessions.py      # GreyNoise API fetch, feed update, run log
+│   ├── fetch_sessions.py          # GreyNoise API fetch, feed update, enrichment, run log
+│   └── enrich_all.py              # Standalone full-cache enrichment script
 ├── feeds/
-│   ├── fortinet_ips.txt       # Public IP blocklist (one IP per line)
-│   └── ip_metadata.json       # Per-IP first_seen/last_seen metadata
-├── data/                      # Session JSON files (one per non-bootstrap run)
-├── runs/                      # Run log JSON files (always written)
+│   ├── fortinet_ips.txt           # Full IP blocklist (one IP per line)
+│   ├── fortinet_ips_filtered.txt  # Filtered feed (malicious/suspicious only)
+│   ├── ip_metadata.json           # Per-IP first_seen/last_seen metadata
+│   └── classification_cache.json  # GreyNoise Community API enrichment cache
+├── data/                          # Session JSON files (one per non-bootstrap run)
+├── runs/                          # Run log JSON files (always written)
 ├── state/
-│   └── today.json             # Daily schedule state
+│   └── today.json                 # Daily schedule state
 ├── requirements.txt
 └── README.md
 ```

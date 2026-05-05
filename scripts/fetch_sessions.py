@@ -282,7 +282,7 @@ def update_threat_feed(
     Maintains a 30-day rolling window — IPs not seen in the last
     FEED_RETENTION_DAYS days are removed from the feed.
 
-    Returns the total number of IPs currently in the feed.
+    Returns a tuple of (total IP count, metadata dict).
     """
     feeds_dir = repo_root / "feeds"
     feeds_dir.mkdir(exist_ok=True)
@@ -350,7 +350,140 @@ def update_threat_feed(
 
     print(f"  [feed] Written: {feed_path.name} ({len(sorted_ips)} IPs)")
 
-    return len(sorted_ips)
+    return len(sorted_ips), metadata
+
+
+COMMUNITY_API = "https://api.greynoise.io/v3/community"
+FILTERED_FEED_CLASSIFICATIONS = {"malicious", "suspicious"}
+
+
+def enrich_ips(
+    ips_to_enrich: list,
+    cache: dict,
+    api_key: str,
+    max_per_min: int = 20,
+) -> dict:
+    """
+    Look up each IP in the GreyNoise Community API and store the result in cache.
+
+    Rate-limited to max_per_min requests per minute (hard limit is 25/min).
+    Returns the updated cache.
+
+    Cache entry format:
+      { "classification": "malicious"|"suspicious"|"benign"|"unknown",
+        "name": str|None, "checked_at": "2026-05-05T12:00:00Z" }
+
+    "unknown" means the IP is not in GreyNoise's dataset at all.
+    """
+    if not ips_to_enrich:
+        return cache
+
+    print(f"  [enrich] {len(ips_to_enrich)} IPs to enrich "
+          f"(rate limit: {max_per_min}/min)")
+
+    req_headers   = {"key": api_key, "Accept": "application/json"}
+    interval      = 60.0 / max_per_min   # seconds between requests
+    done          = 0
+    errors        = 0
+
+    for ip in ips_to_enrich:
+        t_start = time.monotonic()
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        try:
+            resp = requests.get(
+                f"{COMMUNITY_API}/{ip}",
+                headers=req_headers,
+                timeout=15,
+            )
+
+            if resp.status_code == 404:
+                # IP not in GreyNoise dataset — exclude from filtered feed
+                cache[ip] = {
+                    "classification": "unknown",
+                    "name":           None,
+                    "checked_at":     now_str,
+                }
+            elif resp.status_code == 429:
+                print(f"  [enrich] Rate limited — sleeping 60s", file=sys.stderr)
+                time.sleep(60)
+                # Retry once
+                resp = requests.get(
+                    f"{COMMUNITY_API}/{ip}",
+                    headers=req_headers,
+                    timeout=15,
+                )
+                if resp.ok:
+                    data = resp.json()
+                    cache[ip] = {
+                        "classification": data.get("classification", "unknown"),
+                        "name":           data.get("name"),
+                        "checked_at":     now_str,
+                    }
+            elif resp.ok:
+                data = resp.json()
+                cache[ip] = {
+                    "classification": data.get("classification", "unknown"),
+                    "name":           data.get("name"),
+                    "checked_at":     now_str,
+                }
+            else:
+                errors += 1
+                print(f"  [enrich] HTTP {resp.status_code} for {ip} — skipping",
+                      file=sys.stderr)
+
+        except requests.RequestException as exc:
+            errors += 1
+            print(f"  [enrich] Request error for {ip}: {exc}", file=sys.stderr)
+
+        done += 1
+        if done % 50 == 0:
+            pct = done / len(ips_to_enrich) * 100
+            print(f"  [enrich] {done}/{len(ips_to_enrich)} ({pct:.0f}%)")
+
+        # Pace to stay under rate limit
+        elapsed = time.monotonic() - t_start
+        remaining = interval - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+
+    classifications = {}
+    for entry in cache.values():
+        c = entry.get("classification", "unknown")
+        classifications[c] = classifications.get(c, 0) + 1
+
+    print(f"  [enrich] Complete — {done} enriched, {errors} errors. "
+          f"Distribution: {classifications}")
+
+    return cache
+
+
+def update_filtered_feed(
+    cache: dict,
+    metadata: dict,
+    repo_root: Path,
+) -> int:
+    """
+    Write feeds/fortinet_ips_filtered.txt — only IPs in the 30-day rolling
+    metadata that are classified malicious or suspicious in the cache.
+
+    Returns count of IPs written.
+    """
+    feeds_dir = repo_root / "feeds"
+    feeds_dir.mkdir(exist_ok=True)
+
+    filtered_ips = sorted(
+        ip for ip in metadata
+        if cache.get(ip, {}).get("classification") in FILTERED_FEED_CLASSIFICATIONS
+    )
+
+    feed_path = feeds_dir / "fortinet_ips_filtered.txt"
+    feed_path.write_text("\n".join(filtered_ips) + "\n" if filtered_ips else "")
+
+    print(f"  [filtered feed] {len(filtered_ips)} IPs "
+          f"(malicious/suspicious only) → {feed_path.name}")
+
+    return len(filtered_ips)
 
 
 def write_outputs(
@@ -454,15 +587,40 @@ def main() -> None:
 
     t0    = time.monotonic()
     error = None
-    sessions     = []
+    sessions      = []
     feed_ip_count = 0
+    filtered_count = 0
+
+    # Load classification cache
+    cache_path = repo_root / "feeds" / "classification_cache.json"
+    cache: dict = {}
+    if cache_path.exists():
+        try:
+            cache = json.loads(cache_path.read_text())
+        except Exception:
+            cache = {}
 
     try:
         print("[*] Fetching sessions...")
         sessions = fetch_sessions(api_key, workspace_id, window_start, window_end)
 
         print("[*] Updating threat feed...")
-        feed_ip_count = update_threat_feed(sessions, repo_root, now)
+        feed_ip_count, metadata = update_threat_feed(sessions, repo_root, now)
+
+        # Enrich any IPs not yet in the cache
+        new_ips = [ip for ip in metadata if ip not in cache]
+        if new_ips:
+            print(f"[*] Enriching {len(new_ips)} new IPs via GreyNoise Community API...")
+            cache = enrich_ips(new_ips, cache, api_key)
+            cache_path.parent.mkdir(exist_ok=True)
+            cache_path.write_text(json.dumps(cache, indent=2, sort_keys=True))
+            print(f"  [enrich] Cache saved ({len(cache)} total entries)")
+        else:
+            print("[*] No new IPs to enrich.")
+
+        # Write filtered feed
+        print("[*] Updating filtered feed...")
+        filtered_count = update_filtered_feed(cache, metadata, repo_root)
 
     except SystemExit:
         raise
@@ -481,7 +639,7 @@ def main() -> None:
     )
 
     print(f"[*] Done in {duration:.1f}s — {len(sessions)} sessions, "
-          f"{feed_ip_count} IPs in feed.")
+          f"{feed_ip_count} IPs in feed, {filtered_count} in filtered feed.")
 
 
 if __name__ == "__main__":
