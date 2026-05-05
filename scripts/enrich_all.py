@@ -42,6 +42,10 @@ def enrich_all(api_key: str, ips: list, existing_cache: dict) -> dict:
         print("[*] All IPs already in cache — nothing to do.")
         return cache
 
+    # Brief pause before starting — gives any lingering rate-limit window time to clear.
+    print("[*] Cold-start pause: 60s before first request...")
+    time.sleep(60)
+
     total            = len(to_enrich)
     interval         = 60.0 / MAX_PER_MIN
     done             = 0
