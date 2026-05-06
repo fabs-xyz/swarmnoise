@@ -10,7 +10,7 @@ Queries the GreyNoise Swarm sensor activity via two API endpoints:
 
   2. Filtered feed (v3):
      GET https://api.greynoise.io/v3/sessions
-     Supports Lucene query filtering — used to extract only malicious sessions
+     Supports Lucene query filtering — used to extract malicious and suspicious sessions
      and their enriched metadata (tags, CVEs, source geo, etc.).
 
 Auth: key: <GREYNOISE_API_KEY>
@@ -18,7 +18,7 @@ Auth: key: <GREYNOISE_API_KEY>
 Writes session data to data/, a run log to runs/, and maintains two rolling
 30-day FortiGate-ready threat feeds in feeds/:
   - fortinet_ips.txt          — all attacker IPs
-  - fortinet_ips_filtered.txt — confirmed malicious IPs only
+  - fortinet_ips_filtered.txt — confirmed malicious and suspicious IPs
   - filtered_metadata.json    — per-IP enriched metadata from v3 sessions
 
 Environment variables required:
@@ -366,7 +366,7 @@ def update_threat_feed(
 
 
 V3_PAGE_SIZE          = 100
-FILTERED_QUERY        = "classification:malicious"
+FILTERED_QUERY        = "classification:malicious OR classification:suspicious"
 FILTERED_CHUNK_HOURS  = 6
 
 
@@ -437,7 +437,7 @@ def fetch_filtered_sessions(
     window_end: datetime,
 ) -> list:
     """
-    Fetch malicious sessions via v3/sessions with classification:malicious.
+    Fetch malicious and suspicious sessions via v3/sessions.
     Uses time-chunking (6-hour windows) and page-based pagination.
     Returns all matching session objects with full metadata.
     """
@@ -479,12 +479,12 @@ def fetch_filtered_sessions(
             print(f"  [v3 chunk {chunk_num}] "
                   f"{chunk_start.strftime('%Y-%m-%dT%H:%MZ')} → "
                   f"{chunk_end.strftime('%Y-%m-%dT%H:%MZ')}: "
-                  f"{collected} malicious sessions")
+                  f"{collected} malicious+suspicious sessions")
 
         chunk_start = chunk_end
         time.sleep(0.3)
 
-    print(f"  [v3] Total malicious sessions fetched: {len(all_sessions)}")
+    print(f"  [v3] Total filtered sessions fetched: {len(all_sessions)}")
     return all_sessions
 
 
@@ -497,7 +497,7 @@ def update_filtered_feed(
     Update the filtered threat feed and per-IP metadata from v3 session data.
 
     Writes:
-      - feeds/fortinet_ips_filtered.txt  (one malicious IP per line)
+      - feeds/fortinet_ips_filtered.txt  (malicious and suspicious IPs, one per line)
       - feeds/filtered_metadata.json     (enriched per-IP metadata)
 
     Maintains a 30-day rolling window.
@@ -605,7 +605,7 @@ def update_filtered_feed(
     sorted_ips = sorted(metadata.keys())
     feed_path.write_text("\n".join(sorted_ips) + "\n" if sorted_ips else "")
 
-    print(f"  [filtered feed] {len(sorted_ips)} malicious IPs → {feed_path.name}")
+    print(f"  [filtered feed] {len(sorted_ips)} malicious+suspicious IPs → {feed_path.name}")
     print(f"  [filtered feed] Metadata → {metadata_path.name}")
 
     return len(sorted_ips)
