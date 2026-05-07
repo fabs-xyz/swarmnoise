@@ -57,9 +57,11 @@ jobs:
               target_runs = random.randint(1, 10)
 
               # Pick target_runs unique hours from the 24-hour day
-              # Spread them across the full day regardless of current hour
-              # so early-day runs don't cluster everything at the start
               scheduled_hours = sorted(random.sample(range(0, 24), min(target_runs, 24)))
+
+              # Carry over last_fetch_end from the previous day so the time window
+              # correctly spans the overnight gap on the first run of the new day.
+              prev_last_fetch_end = state.get("last_fetch_end")
 
               state = {
                   "date": today_str,
@@ -67,7 +69,8 @@ jobs:
                   "completed_runs": 0,
                   "scheduled_hours": scheduled_hours,
                   "completed_hours": [],
-                  "last_fetch_end": None,
+                  "last_fetch_end": prev_last_fetch_end,
+                  "last_run_failed": False,
               }
 
               state_path.parent.mkdir(exist_ok=True)
@@ -78,17 +81,38 @@ jobs:
           # workflow_dispatch always fetches (bypass schedule gate)
           is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
 
-          # Check if the current hour is a scheduled run that hasn't been done yet
-          should_fetch = is_manual or (
-              current_hour in state.get("scheduled_hours", [])
-              and current_hour not in state.get("completed_hours", [])
+          # Retry logic: if the last run failed, attempt again this tick regardless
+          # of the schedule so we don't silently lose a run.
+          last_run_failed = state.get("last_run_failed", False)
+
+          # Fire if:
+          #   - manual dispatch, OR
+          #   - last run failed (retry), OR
+          #   - any scheduled hour up to and including current_hour has not yet
+          #     been completed — this catches late cron ticks (e.g. hour 8 run
+          #     fires at 08:47 or even 09:03 and would otherwise be skipped).
+          completed_hours = set(state.get("completed_hours", []))
+          scheduled_hours = state.get("scheduled_hours", [])
+          overdue_hours = [
+              h for h in scheduled_hours
+              if h <= current_hour and h not in completed_hours
+          ]
+
+          should_fetch = is_manual or last_run_failed or (
+              bool(overdue_hours)
               and state.get("completed_runs", 0) < state.get("target_runs", 0)
           )
+
           if is_manual:
               print("Manual dispatch — bypassing schedule gate, fetch forced")
+          elif last_run_failed:
+              print(f"Last run failed — retrying this tick (hour={current_hour})")
+          elif overdue_hours:
+              print(f"Overdue scheduled hours detected: {overdue_hours} — triggering fetch")
 
-          # Determine time window for the fetch
-          # Use last_fetch_end as start if available, otherwise 6 hours ago
+          # Determine time window for the fetch.
+          # Always start from last_fetch_end regardless of day boundary so gaps
+          # (overnight, missed runs) are fully covered.
           if should_fetch:
               if state.get("last_fetch_end"):
                   window_start = state["last_fetch_end"]
@@ -108,9 +132,12 @@ jobs:
               f.write(f"current_hour={current_hour}\n")
               f.write(f"target_runs={state.get('target_runs', 0)}\n")
               f.write(f"completed_runs={state.get('completed_runs', 0)}\n")
+              # Pass overdue_hours as a comma-separated string for the state update step
+              overdue_str = ",".join(str(h) for h in overdue_hours) if overdue_hours else ""
+              f.write(f"overdue_hours={overdue_str}\n")
 
           if should_fetch:
-              print(f"Fetch scheduled for hour {current_hour} — window: {window_start} → {window_end}")
+              print(f"Fetch triggered for hour {current_hour} — window: {window_start} → {window_end}")
           else:
               scheduled = state.get("scheduled_hours", [])
               completed = state.get("completed_runs", 0)
@@ -124,13 +151,14 @@ jobs:
 
       - name: Fetch GreyNoise Fortinet sessions
         if: steps.schedule.outputs.should_fetch == 'true'
+        id: fetch
         env:
           TIME_WINDOW_START: ${{ steps.schedule.outputs.window_start }}
           TIME_WINDOW_END: ${{ steps.schedule.outputs.window_end }}
         run: python scripts/fetch_sessions.py
 
       - name: Update state after successful fetch
-        if: steps.schedule.outputs.should_fetch == 'true'
+        if: steps.schedule.outputs.should_fetch == 'true' && steps.fetch.outcome == 'success'
         shell: python
         run: |
           import json
@@ -141,15 +169,40 @@ jobs:
           state = json.loads(state_path.read_text())
 
           current_hour = int("${{ steps.schedule.outputs.current_hour }}")
+          overdue_str = "${{ steps.schedule.outputs.overdue_hours }}"
+          overdue_hours = [int(h) for h in overdue_str.split(",") if h.strip()]
           now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
           state["completed_runs"] += 1
+          # Mark all overdue hours that triggered this run as completed
+          for h in overdue_hours:
+              if h not in state["completed_hours"]:
+                  state["completed_hours"].append(h)
+          # Also mark current_hour if it was a manual/retry run
           if current_hour not in state["completed_hours"]:
               state["completed_hours"].append(current_hour)
           state["last_fetch_end"] = now_str
+          state["last_run_failed"] = False
 
           state_path.write_text(json.dumps(state, indent=2))
           print(f"State updated — completed {state['completed_runs']}/{state['target_runs']} runs today")
+
+      - name: Record fetch failure in state
+        if: steps.schedule.outputs.should_fetch == 'true' && steps.fetch.outcome == 'failure'
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+
+          state_path = Path("state/today.json")
+          try:
+              state = json.loads(state_path.read_text())
+          except Exception:
+              state = {}
+
+          state["last_run_failed"] = True
+          state_path.write_text(json.dumps(state, indent=2))
+          print("Fetch failed — last_run_failed set to True, will retry next cron tick")
 
       - name: Commit and push
         shell: bash
@@ -166,11 +219,12 @@ jobs:
 
           # Build commit message
           SHOULD_FETCH="${{ steps.schedule.outputs.should_fetch }}"
+          FETCH_OUTCOME="${{ steps.fetch.outcome }}"
           COMPLETED="${{ steps.schedule.outputs.completed_runs }}"
           TARGET="${{ steps.schedule.outputs.target_runs }}"
           TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
 
-          if [ "$SHOULD_FETCH" = "true" ]; then
+          if [ "$SHOULD_FETCH" = "true" ] && [ "$FETCH_OUTCOME" = "success" ]; then
             # Count sessions from the most recent run log
             SESSION_COUNT=$(python3 -c "
           import json, glob, os
@@ -195,6 +249,8 @@ jobs:
             else
               MSG="run log: ${TIMESTAMP} — no sessions found, ${FEED_IP_COUNT} IPs in feed (run $((COMPLETED+1))/${TARGET})"
             fi
+          elif [ "$SHOULD_FETCH" = "true" ] && [ "$FETCH_OUTCOME" = "failure" ]; then
+            MSG="fix: ${TIMESTAMP} — fetch failed, retry scheduled for next cron tick"
           else
             MSG="state: ${TIMESTAMP} — daily schedule initialized (${TARGET} runs planned)"
           fi
