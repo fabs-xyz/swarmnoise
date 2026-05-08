@@ -634,17 +634,17 @@ def write_outputs(
     runs_dir.mkdir(exist_ok=True)
 
     # Run log — always written
+    # Note: sensor_id and workspace_id are intentionally excluded — they are
+    # account identifiers that should not be committed to a public repository.
     run_log = {
-        "timestamp":        fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "sensor_id":        sensor_id,
-        "workspace_id":     workspace_id,
+        "timestamp":         fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "time_window_start": window_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "time_window_end":  window_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "sessions_found":   len(sessions),
-        "feed_ip_count":    feed_ip_count,
+        "time_window_end":   window_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "sessions_found":    len(sessions),
+        "feed_ip_count":     feed_ip_count,
         "filtered_ip_count": filtered_ip_count,
-        "duration_seconds": round(duration, 2),
-        "error":            error,
+        "duration_seconds":  round(duration, 2),
+        "error":             error,
     }
     run_log_path = runs_dir / f"{ts_str}_run_log.json"
     run_log_path.write_text(json.dumps(run_log, indent=2))

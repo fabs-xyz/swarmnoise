@@ -1,3 +1,9 @@
 __pycache__/
 *.pyc
 .env
+venv/
+.venv/
+
+# Session data files contain honeypot destination IPs and sensor UUIDs.
+# They are written locally during each run but must never be committed.
+data/

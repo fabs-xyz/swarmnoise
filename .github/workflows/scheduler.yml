@@ -210,7 +210,7 @@ jobs:
           git config user.name  "swarmnoise-bot"
           git config user.email "swarmnoise-bot@users.noreply.github.com"
 
-          git add data/ runs/ state/ feeds/
+          git add runs/ state/ feeds/
 
           if git diff --staged --quiet; then
             echo "Nothing to commit."

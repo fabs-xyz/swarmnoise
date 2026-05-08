@@ -89,7 +89,6 @@ swarmnoise/
 │   ├── fortinet_ips_filtered.txt  # Filtered feed (malicious IPs only)
 │   ├── ip_metadata.json           # Per-IP first_seen/last_seen (full feed)
 │   └── filtered_metadata.json    # Per-IP enriched metadata (filtered feed)
-├── data/                          # Session JSON files (one per non-bootstrap run)
 ├── runs/                          # Run log JSON files (always written)
 ├── state/
 │   └── today.json                 # Daily schedule state
@@ -118,39 +117,10 @@ Set these under **Settings → Secrets and variables → Actions**:
 }
 ```
 
-**`data/YYYY-MM-DD_HHMM.json`** — raw session data (non-bootstrap runs only)
-```json
-{
-  "fetch_timestamp": "2026-05-05T12:00:00Z",
-  "sensor_id": "...",
-  "workspace_id": "...",
-  "time_window_start": "2026-05-05T06:00:00Z",
-  "time_window_end": "2026-05-05T12:00:00Z",
-  "session_count": 412,
-  "sessions": [
-    {
-      "session_id": "...",
-      "source_ip": "192.0.2.1",
-      "source_port": 54321,
-      "destination_ip": "...",
-      "destination_port": 443,
-      "start_time": "2026-05-05T06:01:00Z",
-      "stop_time": "2026-05-05T06:01:02Z",
-      "protocols": ["tcp"],
-      "packets": 4,
-      "bytes": 240,
-      "http_uri": null
-    }
-  ]
-}
-```
-
 **`runs/YYYY-MM-DD_HHMM_run_log.json`** — always written, even if no sessions found
 ```json
 {
   "timestamp": "2026-05-05T12:00:00Z",
-  "sensor_id": "...",
-  "workspace_id": "...",
   "time_window_start": "2026-05-05T06:00:00Z",
   "time_window_end": "2026-05-05T12:00:00Z",
   "sessions_found": 412,
@@ -190,12 +160,9 @@ Set these under **Settings → Secrets and variables → Actions**:
 ## Querying data locally
 
 ```bash
-# Count total sessions across all data files
-jq '[.[].session_count] | add' data/*.json
-
-# List all unique attacker IPs from raw session data
-jq -r '[.[].sessions[].source_ip] | unique[]' data/*.json
-
 # Show current feed IP count
 wc -l feeds/fortinet_ips.txt
+
+# Show enriched metadata for all malicious IPs
+jq '.' feeds/filtered_metadata.json
 ```
