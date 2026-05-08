@@ -39,10 +39,14 @@ jobs:
           import random
           from datetime import datetime, timezone
           from pathlib import Path
+          from zoneinfo import ZoneInfo
 
-          now = datetime.now(timezone.utc)
-          today_str = now.strftime("%Y-%m-%d")
-          current_hour = now.hour
+          BERLIN = ZoneInfo("Europe/Berlin")
+
+          now_utc = datetime.now(timezone.utc)
+          now     = now_utc.astimezone(BERLIN)   # schedule logic runs in Berlin time
+          today_str    = now.strftime("%Y-%m-%d") # "today" = Berlin calendar date
+          current_hour = now.hour                 # hour 0-23 in Berlin time
           state_path = Path("state/today.json")
 
           state = {}
@@ -76,7 +80,7 @@ jobs:
               state_path.parent.mkdir(exist_ok=True)
               state_path.write_text(json.dumps(state, indent=2))
 
-              print(f"New day — scheduled {target_runs} runs at hours: {scheduled_hours}")
+              print(f"New day (Berlin) — scheduled {target_runs} runs at hours: {scheduled_hours}")
 
           # workflow_dispatch always fetches (bypass schedule gate)
           is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
@@ -106,7 +110,7 @@ jobs:
           if is_manual:
               print("Manual dispatch — bypassing schedule gate, fetch forced")
           elif last_run_failed:
-              print(f"Last run failed — retrying this tick (hour={current_hour})")
+              print(f"Last run failed — retrying this tick (Berlin hour={current_hour})")
           elif overdue_hours:
               print(f"Overdue scheduled hours detected: {overdue_hours} — triggering fetch")
 
@@ -118,8 +122,8 @@ jobs:
                   window_start = state["last_fetch_end"]
               else:
                   from datetime import timedelta
-                  window_start = (now - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
-              window_end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+                  window_start = (now_utc - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+              window_end = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
           else:
               window_start = ""
               window_end = ""
@@ -137,12 +141,12 @@ jobs:
               f.write(f"overdue_hours={overdue_str}\n")
 
           if should_fetch:
-              print(f"Fetch triggered for hour {current_hour} — window: {window_start} → {window_end}")
+              print(f"Fetch triggered for Berlin hour {current_hour} — window: {window_start} → {window_end}")
           else:
               scheduled = state.get("scheduled_hours", [])
               completed = state.get("completed_runs", 0)
               target = state.get("target_runs", 0)
-              print(f"No fetch this hour (hour={current_hour}, scheduled={scheduled}, "
+              print(f"No fetch this hour (Berlin hour={current_hour}, scheduled={scheduled}, "
                     f"completed={completed}/{target})")
 
       - name: Install dependencies
