@@ -1,0 +1,102 @@
+name: Monthly Archive Snapshot
+
+on:
+  schedule:
+    - cron: '0 23 * * *'   # Runs daily at 23:00 UTC — guarded to last day of month only
+  workflow_dispatch:        # Manual trigger (bypasses last-day-of-month guard)
+
+permissions:
+  contents: write
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check if today is the last day of the month
+        id: date_check
+        shell: python
+        run: |
+          import os
+          from datetime import datetime, timezone, timedelta
+
+          now      = datetime.now(timezone.utc)
+          tomorrow = now + timedelta(days=1)
+
+          # Last day of month = tomorrow is in a different month
+          is_last_day = (tomorrow.month != now.month)
+
+          is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+
+          should_run = is_last_day or is_manual
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"should_run={'true' if should_run else 'false'}\n")
+              f.write(f"month={now.strftime('%Y-%m')}\n")
+
+          if is_manual and not is_last_day:
+              print(f"Manual dispatch — bypassing last-day-of-month guard (today: {now.strftime('%Y-%m-%d')})")
+          elif is_last_day:
+              print(f"Last day of month confirmed ({now.strftime('%Y-%m-%d')}) — archive will run")
+          else:
+              print(f"Not the last day of the month ({now.strftime('%Y-%m-%d')}) — skipping")
+
+      - name: Checkout repository
+        if: steps.date_check.outputs.should_run == 'true'
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 1
+
+      - name: Setup Python
+        if: steps.date_check.outputs.should_run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run monthly archive script
+        if: steps.date_check.outputs.should_run == 'true'
+        id: archive
+        run: python scripts/archive_month.py
+
+      - name: Commit and push archive
+        if: steps.date_check.outputs.should_run == 'true' && steps.archive.outcome == 'success'
+        shell: bash
+        run: |
+          git config user.name  "swarmnoise-bot"
+          git config user.email "swarmnoise-bot@users.noreply.github.com"
+
+          git add archive/
+
+          if git diff --staged --quiet; then
+            echo "Nothing to commit — archive already up to date."
+            exit 0
+          fi
+
+          MONTH="${{ steps.date_check.outputs.month }}"
+
+          FILTERED_IPS=$(python3 -c "
+          import json
+          from pathlib import Path
+          p = Path('archive/${{ steps.date_check.outputs.month }}/summary.json')
+          if p.exists():
+              d = json.loads(p.read_text())
+              print(d.get('totals', {}).get('filtered_ips', 0))
+          else:
+              print(0)
+          ")
+          SESSIONS=$(python3 -c "
+          import json
+          from pathlib import Path
+          p = Path('archive/${{ steps.date_check.outputs.month }}/summary.json')
+          if p.exists():
+              d = json.loads(p.read_text())
+              print(d.get('totals', {}).get('sessions', 0))
+          else:
+              print(0)
+          ")
+
+          git commit \
+            -m "archive: ${MONTH} monthly snapshot — ${SESSIONS} sessions, ${FILTERED_IPS} filtered IPs" \
+            -m "Co-authored-by: fabs-net <93473332+fabs-net@users.noreply.github.com>"
+          git push
