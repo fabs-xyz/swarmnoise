@@ -1,7 +1,7 @@
 # swarmnoise
 
 <p align="center">
-  <img src="state/swarmnoise-banner_2.png" alt="Swarmnoise banner" />
+  <img src="state/swarmnoise-banner_3.png" alt="Swarmnoise banner" />
 </p>
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](#)
