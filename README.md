@@ -1,5 +1,9 @@
 # swarmnoise
 
+<p align="center">
+  <img src="state/swarmnoise-banner_2.png" alt="Swarmnoise banner" />
+</p>
+
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](#)
 [![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-Automated-2088FF?logo=githubactions&logoColor=white)](#)
 [![Threat Feed](https://img.shields.io/badge/Threat%20Feed-FortiGate%20Ready-B22222)](#)
@@ -33,7 +37,6 @@ It produces newline-separated IP feeds compatible with FortiGate External Threat
 - [Operator playbook](#operator-playbook)
 - [Troubleshooting](#troubleshooting)
 - [Security notes](#security-notes)
-- [Companion dashboard project](#companion-dashboard-project)
 
 ---
 
@@ -293,13 +296,3 @@ jq '.' archive/$(date -u +%Y-%m)/summary.json
 - Never commit API keys or PAT tokens
 - Keep all credentials in GitHub Actions secrets
 - Threat feed outputs are public by design; treat this repository as a public IOC source
-
----
-
-## Companion dashboard project
-
-For visualization and advanced analysis, use:
-
-- [swarmnoise-grafana](https://github.com/fabs-net/swarmnoise-grafana)
-
-That repository pushes Swarmnoise metrics to Grafana Cloud and provides both raw and analyst-focused dashboards.
