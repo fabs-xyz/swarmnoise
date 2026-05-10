@@ -1,32 +1,38 @@
 # swarmnoise
 
 <p align="center">
-  <img src="state/swarmnoise-banner_3.png" alt="Swarmnoise banner" />
+  <img src="state/swarmnoise-banner_2.png" alt="Swarmnoise banner" />
 </p>
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](#)
 [![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-Automated-2088FF?logo=githubactions&logoColor=white)](#)
-[![Threat Feed](https://img.shields.io/badge/Threat%20Feed-FortiGate%20Ready-B22222)](#)
+[![Threat Feed](https://img.shields.io/badge/Threat%20Feed-Firewall%20Ready-B22222)](#)
 [![GreyNoise](https://img.shields.io/badge/Source-GreyNoise%20Swarm-1F2937)](#)
 
-Automated collector for GreyNoise Project Swarm sensor activity, scoped to Fortinet-targeted attack traffic observed by a sensor in Frankfurt, Germany.
+Automated collector for GreyNoise Project Swarm sensor activity. Deploys one or more Swarm sensors and produces newline-separated IP threat feeds compatible with any firewall or security platform that supports external IP block lists — including FortiGate, pfSense/OPNsense, Palo Alto Networks (EDL), and others. Monthly snapshots are archived for long-term evidence retention.
 
-It produces newline-separated IP feeds compatible with FortiGate External Threat Feeds and archives monthly snapshots for long-term evidence retention.
+---
+
+## Data & Licensing
+
+- **You must provide your own GreyNoise account.** This project uses the GreyNoise API. All use of GreyNoise data is subject to the [GreyNoise EULA](https://www.greynoise.io/terms).
+- **No live or real threat data is included in this repository.** Files under `feeds/`, `runs/`, and `state/` contain synthetic example data only. Deploy your own instance and configure your secrets to collect real data.
+- GreyNoise is a trademark of GreyNoise Intelligence, Inc. Fortinet, FortiGate, Palo Alto Networks, pfSense, and OPNsense are trademarks of their respective owners. All trademarks are used for identification purposes only.
 
 ---
 
 ## At a glance
 
-- Scope: attacker source IPs seen by your Swarm sensor
+- Scope: attacker source IPs seen by your Swarm sensor(s)
 - Output: full feed + filtered feed + enriched metadata + run logs + monthly archive
 - Runtime: GitHub Actions only (no self-hosted infrastructure)
 - Update model: randomized 1 to 10 fetches/day via hourly scheduler checks
-- Integration: direct HTTPS feed consumption by FortiGate and other firewalls
+- Integration: direct HTTPS feed consumption by any firewall supporting external IP block lists
 
 ## Table of contents
 
 - [Threat feeds](#threat-feeds)
-- [FortiGate integration](#fortigate-integration)
+- [Firewall integration](#firewall-integration)
 - [Collection architecture](#collection-architecture)
 - [Scheduler behavior](#scheduler-behavior)
 - [Monthly archive snapshots](#monthly-archive-snapshots)
@@ -45,18 +51,18 @@ It produces newline-separated IP feeds compatible with FortiGate External Threat
 ### Full feed
 
 ```text
-https://raw.githubusercontent.com/fabs-net/swarmnoise/main/feeds/fortinet_ips.txt
+https://raw.githubusercontent.com/<your-org>/<your-repo>/main/feeds/threat_feed.txt
 ```
 
 All source IPs observed attacking the sensor in the last 30 days.
 
-- highest coverage
-- higher false-positive risk than filtered feed
+- Highest coverage
+- Higher false-positive risk than the filtered feed
 
 ### Filtered feed
 
 ```text
-https://raw.githubusercontent.com/fabs-net/swarmnoise/main/feeds/fortinet_ips_filtered.txt
+https://raw.githubusercontent.com/<your-org>/<your-repo>/main/feeds/threat_feed_filtered.txt
 ```
 
 Subset of the full feed where session classification matches:
@@ -68,24 +74,54 @@ The filtered stream is built from the [GreyNoise v3 Sessions API](https://docs.g
 
 Both feeds are:
 
-- one IP per line (no comments, no headers)
-- rolling 30-day window (auto-pruned)
-- updated at randomized times each day
+- One IP per line (no comments, no headers)
+- Rolling 30-day window (auto-pruned)
+- Updated at randomized times each day
 
 ---
 
-## FortiGate integration
+## Firewall integration
 
-Path: `Security Fabric -> External Connectors -> Threat Feeds -> IP Address`
+Both feed files are plain newline-separated IP lists with no headers or comments, making them compatible with any platform that supports external IP block lists or threat feed connectors.
+
+### Generic configuration
 
 | Field | Value |
 |---|---|
-| Name | `swarmnoise-fortinet` |
-| URI | `https://raw.githubusercontent.com/fabs-net/swarmnoise/main/feeds/fortinet_ips.txt` |
+| Feed URL (full) | `https://raw.githubusercontent.com/<your-org>/<your-repo>/main/feeds/threat_feed.txt` |
+| Feed URL (filtered) | `https://raw.githubusercontent.com/<your-org>/<your-repo>/main/feeds/threat_feed_filtered.txt` |
+| Format | One IP per line, no headers |
+| Authentication | None (public repo) or token-based (private repo) |
+| Recommended refresh | 60 min |
+
+### Platform examples
+
+**FortiGate** — `Security Fabric → External Connectors → Threat Feeds → IP Address`
+
+| Field | Value |
+|---|---|
+| Name | `swarmnoise` |
+| URI | feed URL from above |
 | HTTP basic auth | off |
 | Refresh rate | 60 min |
 
-For lower false-positive tolerance, use `fortinet_ips_filtered.txt` as URI.
+**Palo Alto Networks (EDL)** — `Objects → External Dynamic Lists`
+
+| Field | Value |
+|---|---|
+| Type | IP List |
+| Source | feed URL from above |
+| Repeat | Every hour |
+
+**pfSense / OPNsense** — `Firewall → Aliases → URLs`
+
+| Field | Value |
+|---|---|
+| Type | URL Table (IPs) |
+| URL | feed URL from above |
+| Refresh | 1 day (or use cron for hourly) |
+
+For lower false-positive tolerance, use `threat_feed_filtered.txt` as the feed URL on any platform.
 
 ---
 
@@ -154,8 +190,8 @@ swarmnoise/
     fetch_sessions.py
     archive_month.py
   feeds/
-    fortinet_ips.txt
-    fortinet_ips_filtered.txt
+    threat_feed.txt
+    threat_feed_filtered.txt
     ip_metadata.json
     filtered_metadata.json
   runs/
@@ -174,14 +210,32 @@ swarmnoise/
 
 ## Setup
 
-Set these secrets in `Settings -> Secrets and variables -> Actions`:
+### 1. Fork or clone this repository
+
+Fork `swarmnoise` into your own GitHub account or organization.
+
+### 2. Set GitHub Actions secrets
+
+Go to `Settings → Secrets and variables → Actions` in your fork and add:
 
 | Secret | Description |
 |---|---|
-| `GREYNOISE_API_KEY` | GreyNoise API key |
+| `GREYNOISE_API_KEY` | GreyNoise API key (from `viz.greynoise.io` → Settings → API) |
 | `WORKSPACE_ID` | GreyNoise workspace UUID |
 | `SENSOR_ID` | Swarm sensor UUID |
-| `GH_PAT` | GitHub PAT used by workflows for commit/push |
+| `GH_PAT` | GitHub Personal Access Token with `repo` scope (used by workflows to commit feed updates) |
+
+### 3. Enable GitHub Actions
+
+Actions are enabled by default on forks. Verify both workflows are active under `Actions → Workflows`.
+
+### 4. Trigger a first run
+
+Use `workflow_dispatch` on the `Scheduler — Randomized Daily Fetch` workflow to force an immediate bootstrap fetch. The first run will collect the last 30 days of sensor data automatically.
+
+### 5. Point your firewall at the feed URLs
+
+Replace `<your-org>/<your-repo>` in the feed URLs with your fork's path. If the repo is private, configure token-based access on your firewall platform.
 
 ---
 
@@ -227,8 +281,8 @@ Set these secrets in `Settings -> Secrets and variables -> Actions`:
     "cves": [],
     "country": "United States",
     "country_code": "US",
-    "asn": "AS32181",
-    "org": "GigeNET",
+    "asn": "AS64496",
+    "org": "Example ISP",
     "is_vpn": false,
     "is_tor": false,
     "is_bot": false,
@@ -246,10 +300,10 @@ Set these secrets in `Settings -> Secrets and variables -> Actions`:
 
 ```bash
 # Count full-feed IPs
-wc -l feeds/fortinet_ips.txt
+wc -l feeds/threat_feed.txt
 
 # Count filtered-feed IPs
-wc -l feeds/fortinet_ips_filtered.txt
+wc -l feeds/threat_feed_filtered.txt
 
 # Inspect enriched metadata
 jq '.' feeds/filtered_metadata.json
@@ -262,11 +316,11 @@ jq '.' archive/$(date -u +%Y-%m)/summary.json
 
 ## Operator playbook
 
-1. Start with `fortinet_ips_filtered.txt` in production deny policies
+1. Start with `threat_feed_filtered.txt` in production deny policies
 2. Track feed growth and churn using `runs/*_run_log.json`
 3. Review `filtered_metadata.json` tags/CVEs before adding custom block automation
 4. Use monthly `archive/YYYY-MM/summary.json` for trend baselining
-5. Use `fortinet_ips.txt` for broader detection-focused controls where acceptable
+5. Use `threat_feed.txt` for broader detection-focused controls where acceptable
 
 ---
 
@@ -295,4 +349,5 @@ jq '.' archive/$(date -u +%Y-%m)/summary.json
 
 - Never commit API keys or PAT tokens
 - Keep all credentials in GitHub Actions secrets
-- Threat feed outputs are public by design; treat this repository as a public IOC source
+- If the repository is public, the feed files are publicly accessible — this is intentional for firewall consumption; ensure you are comfortable with your sensor's activity being visible
+- If you prefer private feeds, keep the repository private and configure token-based access on your firewall platform

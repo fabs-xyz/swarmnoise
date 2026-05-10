@@ -1,0 +1,6 @@
+# Example filtered threat feed — synthetic data only
+# Subset of threat_feed.txt where classification is malicious or suspicious.
+# These IPs are RFC 5737 documentation addresses and are not real attackers.
+192.0.2.1
+198.51.100.42
+203.0.113.99

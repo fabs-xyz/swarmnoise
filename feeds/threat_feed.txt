@@ -1,0 +1,9 @@
+# Example threat feed — synthetic data only
+# Real data is collected by your own instance via GitHub Actions.
+# These IPs are RFC 5737 documentation addresses and are not real attackers.
+# Format: one IP per line, no headers (this comment block is for reference only).
+192.0.2.1
+192.0.2.14
+198.51.100.7
+198.51.100.42
+203.0.113.99

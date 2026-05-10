@@ -16,9 +16,9 @@ Queries the GreyNoise Swarm sensor activity via two API endpoints:
 Auth: key: <GREYNOISE_API_KEY>
 
 Writes session data to data/, a run log to runs/, and maintains two rolling
-30-day FortiGate-ready threat feeds in feeds/:
-  - fortinet_ips.txt          — all attacker IPs
-  - fortinet_ips_filtered.txt — confirmed malicious and suspicious IPs
+30-day firewall-compatible threat feeds in feeds/:
+  - threat_feed.txt          — all attacker IPs
+  - threat_feed_filtered.txt — confirmed malicious and suspicious IPs
   - filtered_metadata.json    — per-IP enriched metadata from v3 sessions
 
 Environment variables required:
@@ -289,7 +289,7 @@ def update_threat_feed(
     fetch_ts: datetime,
 ) -> int:
     """
-    Update the FortiGate threat feed with IPs from the fetched sessions.
+    Update the firewall-compatible threat feed with IPs from the fetched sessions.
 
     Maintains a 30-day rolling window — IPs not seen in the last
     FEED_RETENTION_DAYS days are removed from the feed.
@@ -300,7 +300,7 @@ def update_threat_feed(
     feeds_dir.mkdir(exist_ok=True)
 
     metadata_path = feeds_dir / "ip_metadata.json"
-    feed_path     = feeds_dir / "fortinet_ips.txt"
+    feed_path     = feeds_dir / "threat_feed.txt"
 
     # Load existing metadata
     metadata: dict = {}
@@ -356,7 +356,7 @@ def update_threat_feed(
     # Write ip_metadata.json
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
 
-    # Write fortinet_ips.txt — sorted, one IP per line, no comments
+    # Write threat_feed.txt — sorted, one IP per line, no comments
     sorted_ips = sorted(metadata.keys())
     feed_path.write_text("\n".join(sorted_ips) + "\n" if sorted_ips else "")
 
@@ -497,8 +497,8 @@ def update_filtered_feed(
     Update the filtered threat feed and per-IP metadata from v3 session data.
 
     Writes:
-      - feeds/fortinet_ips_filtered.txt  (malicious and suspicious IPs, one per line)
-      - feeds/filtered_metadata.json     (enriched per-IP metadata)
+      - feeds/threat_feed_filtered.txt  (malicious and suspicious IPs, one per line)
+      - feeds/filtered_metadata.json    (enriched per-IP metadata)
 
     Maintains a 30-day rolling window.
 
@@ -508,7 +508,7 @@ def update_filtered_feed(
     feeds_dir.mkdir(exist_ok=True)
 
     metadata_path = feeds_dir / "filtered_metadata.json"
-    feed_path     = feeds_dir / "fortinet_ips_filtered.txt"
+    feed_path     = feeds_dir / "threat_feed_filtered.txt"
 
     metadata: dict = {}
     if metadata_path.exists():

@@ -1,0 +1,9 @@
+{
+  "date": null,
+  "target_runs": 0,
+  "completed_runs": 0,
+  "scheduled_hours": [],
+  "completed_hours": [],
+  "last_fetch_end": null,
+  "last_run_failed": false
+}
