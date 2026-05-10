@@ -1,35 +1,79 @@
 # swarmnoise
 
-Automated collector for GreyNoise Project Swarm sensor data, scoped to Fortinet-targeted attack traffic observed by a sensor in Frankfurt, Germany.
+[![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](#)
+[![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-Automated-2088FF?logo=githubactions&logoColor=white)](#)
+[![Threat Feed](https://img.shields.io/badge/Threat%20Feed-FortiGate%20Ready-B22222)](#)
+[![GreyNoise](https://img.shields.io/badge/Source-GreyNoise%20Swarm-1F2937)](#)
 
-Produces a plain-text IP feed compatible with **FortiGate External Threat Feed** (and any other firewall that consumes a newline-separated IP blocklist over HTTPS).
+Automated collector for GreyNoise Project Swarm sensor activity, scoped to Fortinet-targeted attack traffic observed by a sensor in Frankfurt, Germany.
+
+It produces newline-separated IP feeds compatible with FortiGate External Threat Feeds and archives monthly snapshots for long-term evidence retention.
+
+---
+
+## At a glance
+
+- Scope: attacker source IPs seen by your Swarm sensor
+- Output: full feed + filtered feed + enriched metadata + run logs + monthly archive
+- Runtime: GitHub Actions only (no self-hosted infrastructure)
+- Update model: randomized 1 to 10 fetches/day via hourly scheduler checks
+- Integration: direct HTTPS feed consumption by FortiGate and other firewalls
+
+## Table of contents
+
+- [Threat feeds](#threat-feeds)
+- [FortiGate integration](#fortigate-integration)
+- [Collection architecture](#collection-architecture)
+- [Scheduler behavior](#scheduler-behavior)
+- [Monthly archive snapshots](#monthly-archive-snapshots)
+- [Repository structure](#repository-structure)
+- [Setup](#setup)
+- [File schemas](#file-schemas)
+- [Querying data locally](#querying-data-locally)
+- [Operator playbook](#operator-playbook)
+- [Troubleshooting](#troubleshooting)
+- [Security notes](#security-notes)
+- [Companion dashboard project](#companion-dashboard-project)
+
+---
 
 ## Threat feeds
 
 ### Full feed
 
-```
+```text
 https://raw.githubusercontent.com/fabs-net/swarmnoise/main/feeds/fortinet_ips.txt
 ```
 
-All source IPs observed attacking the sensor in the last 30 days. Best coverage, slightly higher false-positive risk.
+All source IPs observed attacking the sensor in the last 30 days.
+
+- highest coverage
+- higher false-positive risk than filtered feed
 
 ### Filtered feed
 
-```
+```text
 https://raw.githubusercontent.com/fabs-net/swarmnoise/main/feeds/fortinet_ips_filtered.txt
 ```
 
-Subset of the full feed where the session is classified **malicious** by GreyNoise. Sourced from the [GreyNoise v3 Sessions API](https://docs.greynoise.io/reference/getsessions) with Lucene query filtering — no rate-limited enrichment APIs involved. Each IP includes enriched metadata (tags, CVEs, source geo, Suricata signatures) in `feeds/filtered_metadata.json`.
+Subset of the full feed where session classification matches:
 
-Both feeds:
-- One IP per line, no comments, no headers
-- Rolling 30-day window — IPs not seen in 30 days are pruned automatically
-- Updated 1–10 times per day at randomised times
+- `classification:malicious`
+- `classification:suspicious`
 
-### FortiGate setup
+The filtered stream is built from the [GreyNoise v3 Sessions API](https://docs.greynoise.io/reference/getsessions) and includes enriched metadata in `feeds/filtered_metadata.json` (tags, CVEs, geo, ASN/org, Suricata signatures, protocols, destination ports).
 
-**Security Fabric → External Connectors → Threat Feeds → IP Address**
+Both feeds are:
+
+- one IP per line (no comments, no headers)
+- rolling 30-day window (auto-pruned)
+- updated at randomized times each day
+
+---
+
+## FortiGate integration
+
+Path: `Security Fabric -> External Connectors -> Threat Feeds -> IP Address`
 
 | Field | Value |
 |---|---|
@@ -38,86 +82,121 @@ Both feeds:
 | HTTP basic auth | off |
 | Refresh rate | 60 min |
 
-For the lower false-positive filtered feed, use `fortinet_ips_filtered.txt` as the URI instead.
+For lower false-positive tolerance, use `fortinet_ips_filtered.txt` as URI.
 
-Then reference the connector in a firewall policy with action **Deny** or in an IPS sensor.
+---
 
-## How it works
+## Collection architecture
 
-A GitHub Actions workflow fires **every hour**. Each day at midnight UTC it:
-
-1. Picks a random number between **1 and 10** — the number of fetches for that day
-2. Distributes those fetches randomly across the remaining hours of the day
-3. Persists the schedule in `state/today.json`
-
-Each subsequent hourly check compares the current hour against the schedule and fires a fetch when due. On `workflow_dispatch` (manual trigger) the schedule gate is bypassed and a fetch always runs.
-
-The commit pattern is **organic and unpredictable** — anywhere from 1 to 10 commits per day at random times.
-
-### Two-API architecture
-
-The collector uses two separate GreyNoise API endpoints:
+The collector uses two GreyNoise API paths in parallel:
 
 | | Full feed | Filtered feed |
 |---|---|---|
-| **API** | v1 Swarm (`/v1/workspaces/{id}/sensors/activity`) | v3 Sessions (`/v3/sessions`) |
-| **Filter** | None — all sessions | `classification:malicious` (Lucene query) |
-| **Page size** | 1,000 | 100 |
-| **Pagination** | 30-min time chunks (scroll token unusable) | Standard page-based |
-| **Metadata** | Basic (IP, port, protocol) | Rich (tags, CVEs, geo, Suricata) |
+| API | v1 Swarm (`/v1/workspaces/{id}/sensors/activity`) | v3 Sessions (`/v3/sessions`) |
+| Filter | none | `classification:malicious OR classification:suspicious` |
+| Page size | 1000 | 100 |
+| Pagination | 30-minute chunk windows | page-based |
+| Metadata depth | basic | enriched (tags, CVEs, geo, signatures) |
 
-### First run (bootstrap)
+### First run bootstrap
 
-On the first run `feeds/ip_metadata.json` does not exist, so the script automatically bootstraps the feed by fetching the last 30 days of data. This takes ~37 minutes (1,437 API calls at 0.5 s/call).
+If `feeds/ip_metadata.json` does not exist, bootstrap mode fetches the last 30 days automatically.
 
-### Pagination
+### Pagination constraints
 
-The GreyNoise API caps responses at 1,000 sessions per request. The scroll/cursor token it returns is ~8 KB of base64 — too large to pass back as a query parameter (HTTP 414) or request header (HTTP 400). Scrolling is therefore not used.
+The v1 scroll token is too large to reuse safely in request paths/headers, so v1 collection runs in 30-minute time chunks. This keeps feed convergence high and operationally stable under API limits.
 
-Instead, each fetch window is split into **30-minute chunks**. At the observed sensor rate (~2,000 sessions/30 min) some chunks still hit the 1,000-session cap and a subset of sessions in those windows may be missed. The IP feed is still comprehensive — unique attacker IPs converge quickly across repeated fetches.
+---
+
+## Scheduler behavior
+
+Workflow: `.github/workflows/scheduler.yml`
+
+- Hourly cron trigger (`0 * * * *`)
+- Daily random plan generated in Berlin time (`Europe/Berlin`)
+- Randomized target: 1 to 10 runs/day
+- Scheduled hours persisted in `state/today.json`
+- Missed-hour catch-up logic included (overdue hour handling)
+- On failure, automatic retry at next cron tick
+- `workflow_dispatch` bypasses schedule gating and forces a fetch
+
+Result: organic, hard-to-predict update timing rather than rigid fixed intervals.
+
+---
+
+## Monthly archive snapshots
+
+Workflow: `.github/workflows/monthly_archive.yml`
+
+- Triggered daily at `23:00 UTC`
+- Executes only on the last day of month (manual dispatch can bypass guard)
+- Runs `scripts/archive_month.py`
+- Writes `archive/YYYY-MM/` with:
+  - `filtered_metadata.json`
+  - `ip_metadata.json`
+  - `summary.json`
+
+This provides durable month-end snapshots independent of the rolling 30-day live window.
+
+---
 
 ## Repository structure
 
-```
+```text
 swarmnoise/
-├── .github/workflows/
-│   └── scheduler.yml              # Hourly trigger, randomised schedule logic + fetch
-├── scripts/
-│   └── fetch_sessions.py          # v1 full feed + v3 filtered feed, run log
-├── feeds/
-│   ├── fortinet_ips.txt           # Full IP blocklist (one IP per line)
-│   ├── fortinet_ips_filtered.txt  # Filtered feed (malicious IPs only)
-│   ├── ip_metadata.json           # Per-IP first_seen/last_seen (full feed)
-│   └── filtered_metadata.json    # Per-IP enriched metadata (filtered feed)
-├── runs/                          # Run log JSON files (always written)
-├── state/
-│   └── today.json                 # Daily schedule state
-├── requirements.txt
-└── README.md
+  .github/workflows/
+    scheduler.yml
+    monthly_archive.yml
+  scripts/
+    fetch_sessions.py
+    archive_month.py
+  feeds/
+    fortinet_ips.txt
+    fortinet_ips_filtered.txt
+    ip_metadata.json
+    filtered_metadata.json
+  runs/
+  state/
+    today.json
+  archive/
+    YYYY-MM/
+      filtered_metadata.json
+      ip_metadata.json
+      summary.json
+  requirements.txt
+  README.md
 ```
 
-## GitHub Secrets required
+---
 
-Set these under **Settings → Secrets and variables → Actions**:
+## Setup
+
+Set these secrets in `Settings -> Secrets and variables -> Actions`:
 
 | Secret | Description |
 |---|---|
-| `GREYNOISE_API_KEY` | GreyNoise API key (viz.greynoise.io → Settings → API Key) |
+| `GREYNOISE_API_KEY` | GreyNoise API key |
 | `WORKSPACE_ID` | GreyNoise workspace UUID |
-| `SENSOR_ID` | Swarm sensor UUID (viz.greynoise.io → Observe → Sensors) |
+| `SENSOR_ID` | Swarm sensor UUID |
+| `GH_PAT` | GitHub PAT used by workflows for commit/push |
 
-`GITHUB_TOKEN` is used automatically by Actions for commits — no PAT required.
+---
 
 ## File schemas
 
-**`feeds/ip_metadata.json`** — rolling 30-day IP index
+`feeds/ip_metadata.json` (rolling 30-day index)
+
 ```json
 {
-  "192.0.2.1": { "first_seen": "2026-04-05T09:00:00Z", "last_seen": "2026-05-05T10:26:00Z" }
+  "192.0.2.1": {
+    "first_seen": "2026-04-05T09:00:00Z",
+    "last_seen": "2026-05-05T10:26:00Z"
+  }
 }
 ```
 
-**`runs/YYYY-MM-DD_HHMM_run_log.json`** — always written, even if no sessions found
+`runs/YYYY-MM-DD_HHMM_run_log.json` (always written)
+
 ```json
 {
   "timestamp": "2026-05-05T12:00:00Z",
@@ -131,7 +210,8 @@ Set these under **Settings → Secrets and variables → Actions**:
 }
 ```
 
-**`feeds/filtered_metadata.json`** — per-IP enriched metadata (filtered feed only)
+`feeds/filtered_metadata.json` (enriched filtered-feed metadata)
+
 ```json
 {
   "192.0.2.1": {
@@ -157,12 +237,69 @@ Set these under **Settings → Secrets and variables → Actions**:
 }
 ```
 
+---
+
 ## Querying data locally
 
 ```bash
-# Show current feed IP count
+# Count full-feed IPs
 wc -l feeds/fortinet_ips.txt
 
-# Show enriched metadata for all malicious IPs
+# Count filtered-feed IPs
+wc -l feeds/fortinet_ips_filtered.txt
+
+# Inspect enriched metadata
 jq '.' feeds/filtered_metadata.json
+
+# Inspect latest monthly snapshot summary
+jq '.' archive/$(date -u +%Y-%m)/summary.json
 ```
+
+---
+
+## Operator playbook
+
+1. Start with `fortinet_ips_filtered.txt` in production deny policies
+2. Track feed growth and churn using `runs/*_run_log.json`
+3. Review `filtered_metadata.json` tags/CVEs before adding custom block automation
+4. Use monthly `archive/YYYY-MM/summary.json` for trend baselining
+5. Use `fortinet_ips.txt` for broader detection-focused controls where acceptable
+
+---
+
+## Troubleshooting
+
+### No feed updates visible
+
+- Check latest run in Actions (`Scheduler - Randomized Daily Fetch`)
+- Verify `state/today.json` has scheduled hours and completed runs
+- Confirm required secrets are set (`GREYNOISE_API_KEY`, `WORKSPACE_ID`, `SENSOR_ID`, `GH_PAT`)
+
+### Workflow runs but no sessions found
+
+- This can be legitimate for low-activity windows
+- Check run log `error` field and time window coverage
+- Manual dispatch can force an immediate run for validation
+
+### Archive did not appear
+
+- Archive workflow only writes on last day of month unless manually triggered
+- Check `.github/workflows/monthly_archive.yml` logs for guard decision output
+
+---
+
+## Security notes
+
+- Never commit API keys or PAT tokens
+- Keep all credentials in GitHub Actions secrets
+- Threat feed outputs are public by design; treat this repository as a public IOC source
+
+---
+
+## Companion dashboard project
+
+For visualization and advanced analysis, use:
+
+- [swarmnoise-grafana](https://github.com/fabs-net/swarmnoise-grafana)
+
+That repository pushes Swarmnoise metrics to Grafana Cloud and provides both raw and analyst-focused dashboards.
