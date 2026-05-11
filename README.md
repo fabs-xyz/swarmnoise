@@ -80,9 +80,27 @@ Go to `Settings → Secrets and variables → Actions` in your fork and add:
 | `SENSOR_IDS` | Comma-separated sensor definitions in `uuid:label` format, e.g. `a1b2c3d4-...:berlin,e5f6g7h8-...:tokyo`. For a single sensor, use `uuid:default`. Backward-compatible: if `SENSOR_IDS` is not set, falls back to `SENSOR_ID`. |
 | `GH_PAT` | GitHub Personal Access Token (classic) with `repo` scope — used by workflows to commit feed updates back to the repository |
 
-### 3. Enable GitHub Actions
+### 3. Activate the scheduled workflows
 
-Actions are enabled by default on forks. Verify both workflows are active under `Actions → Workflows`.
+The workflow files ship with their `schedule` triggers **commented out** so this blueprint repository does not produce spurious failed runs. In your fork, uncomment the `schedule` block in both files:
+
+**`.github/workflows/scheduler.yml`**
+```yaml
+on:
+  schedule:
+    - cron: '0 * * * *'   # Every hour on the hour
+  workflow_dispatch:
+```
+
+**`.github/workflows/monthly_archive.yml`**
+```yaml
+on:
+  schedule:
+    - cron: '0 23 * * *'   # Runs daily at 23:00 UTC
+  workflow_dispatch:
+```
+
+Commit the changes, then verify both workflows appear under **Actions → Workflows**.
 
 ### 4. Trigger a first run
 
