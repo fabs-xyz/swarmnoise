@@ -29,11 +29,12 @@ Environment variables required:
                        Falls back to SENSOR_ID (single sensor, label "default").
 """
 
+import ipaddress
 import json
 import os
 import sys
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -46,11 +47,30 @@ PAGE_SIZE            = 1000
 FEED_RETENTION_DAYS  = 30
 
 
+class SwarmNoiseError(Exception):
+    pass
+
+
+class ConfigError(SwarmNoiseError):
+    pass
+
+
+class APIError(SwarmNoiseError):
+    def __init__(self, message: str, status_code: int = 0):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def atomic_write(path: Path, content: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content)
+    tmp.replace(path)
+
+
 def get_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
-        print(f"[error] Missing required environment variable: {name}", file=sys.stderr)
-        sys.exit(1)
+        raise ConfigError(f"Required environment variable {name} is not set")
     return value
 
 
@@ -80,7 +100,7 @@ def parse_sensor_ids() -> dict[str, str]:
         return {fallback: "default"}
 
     print("[error] Neither SENSOR_IDS nor SENSOR_ID is set.", file=sys.stderr)
-    sys.exit(1)
+    raise ConfigError("Neither SENSOR_IDS nor SENSOR_ID is set")
 
 
 def _extract_sensor_id(session: dict) -> str | None:
@@ -111,47 +131,24 @@ def _fetch_page(
         print(f"  [page {page_num}] HTTP {resp.status_code}")
 
         if resp.status_code == 401:
-            print(
-                "[error] 401 Unauthorized — GREYNOISE_API_KEY is invalid or expired.\n"
-                "        Refresh it at: viz.greynoise.io → Settings → API Key\n"
-                f"        Response: {resp.text[:300]}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            raise APIError(f"Unauthorized (HTTP {resp.status_code})", status_code=resp.status_code)
         if resp.status_code == 403:
-            print(
-                f"[error] 403 Forbidden — API key lacks access to workspace.\n"
-                f"        Response: {resp.text[:300]}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            raise APIError(f"Forbidden (HTTP {resp.status_code})", status_code=resp.status_code)
         if resp.status_code == 404:
-            print(
-                f"[error] 404 Not Found — workspace not found or inaccessible.\n"
-                f"        Response: {resp.text[:300]}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            raise APIError(f"HTTP {resp.status_code}: {resp.text[:200]}", status_code=resp.status_code)
         if resp.status_code in (429, 500, 502, 503, 504):
-            # Transient / rate-limit error — signal to caller for retry
             raise requests.HTTPError(
                 f"HTTP {resp.status_code}: {resp.text[:200]}", response=resp
             )
         if not resp.ok:
-            print(
-                f"[error] HTTP {resp.status_code} on page {page_num}.\n"
-                f"        Response: {resp.text[:500]}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            raise APIError(f"HTTP {resp.status_code}: {resp.text[:200]}", status_code=resp.status_code)
 
         data = resp.json()
 
     except requests.HTTPError:
         raise
     except requests.RequestException as exc:
-        print(f"[error] Request failed on page {page_num}: {exc}", file=sys.stderr)
-        sys.exit(1)
+        raise APIError(f"Request failed on page {page_num}: {exc}")
 
 
 
@@ -220,7 +217,6 @@ def fetch_sessions(
         "Accept": "application/json",
     }
 
-    total_duration = (window_end - window_start).total_seconds()
     # The X-Scroll-Id token (~8KB base64) cannot be passed back either as a
     # query param (HTTP 414) or as a request header (HTTP 400 header too large).
     # Strategy: use 30-minute time chunks. At ~167 sessions/hour observed rate,
@@ -357,8 +353,10 @@ def update_threat_feed(
     if metadata_path.exists():
         try:
             metadata = json.loads(metadata_path.read_text())
-        except Exception:
-            metadata = {}
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[!] Corrupt file {metadata_path.name}: {exc} — backing up and resetting", file=sys.stderr)
+            corrupt_path = metadata_path.with_suffix(metadata_path.suffix + ".corrupt")
+            metadata_path.rename(corrupt_path)
 
     now_str = fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
     cutoff  = fetch_ts - timedelta(days=FEED_RETENTION_DAYS)
@@ -378,6 +376,12 @@ def update_threat_feed(
         if not ip or not isinstance(ip, str) or not ip.strip():
             continue
         ip = ip.strip()
+
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            print(f"[!] Skipping invalid IP: {ip}", file=sys.stderr)
+            continue
 
         sensor_uuid = _extract_sensor_id(session) if sensor_map else None
         label = sensor_map.get(sensor_uuid, "unknown") if sensor_uuid and sensor_map else None
@@ -419,10 +423,10 @@ def update_threat_feed(
 
     print(f"  [feed] {new_count} new IPs added, {len(metadata)} total IPs in feed")
 
-    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
+    atomic_write(metadata_path, json.dumps(metadata, indent=2, sort_keys=True))
 
     sorted_ips = sorted(metadata.keys())
-    feed_path.write_text("\n".join(sorted_ips) + "\n" if sorted_ips else "")
+    atomic_write(feed_path, "\n".join(sorted_ips) + "\n" if sorted_ips else "")
 
     print(f"  [feed] Written: {feed_path.name} ({len(sorted_ips)} IPs)")
 
@@ -474,9 +478,7 @@ def _v3_fetch_page(
                 continue
 
             if resp.status_code in (401, 403):
-                print(f"[error] v3 sessions HTTP {resp.status_code}: "
-                      f"{resp.text[:300]}", file=sys.stderr)
-                sys.exit(1)
+                raise APIError(f"v3 sessions HTTP {resp.status_code}: {resp.text[:300]}", status_code=resp.status_code)
 
             if not resp.ok:
                 print(f"[error] v3 sessions HTTP {resp.status_code} on page {page}: "
@@ -588,8 +590,10 @@ def update_filtered_feed(
     if metadata_path.exists():
         try:
             metadata = json.loads(metadata_path.read_text())
-        except Exception:
-            metadata = {}
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[!] Corrupt file {metadata_path.name}: {exc} — backing up and resetting", file=sys.stderr)
+            corrupt_path = metadata_path.with_suffix(metadata_path.suffix + ".corrupt")
+            metadata_path.rename(corrupt_path)
 
     now_str = fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
     cutoff  = fetch_ts - timedelta(days=FEED_RETENTION_DAYS)
@@ -600,6 +604,12 @@ def update_filtered_feed(
 
         ip = (session.get("source") or {}).get("ip")
         if not ip or not isinstance(ip, str):
+            continue
+
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            print(f"[!] Skipping invalid IP: {ip}", file=sys.stderr)
             continue
 
         src_meta = session.get("sourceMetadata") or {}
@@ -690,10 +700,10 @@ def update_filtered_feed(
             entry["seen_by"] = merged
         entry["multi_sensor"] = len(entry.get("seen_by", [])) >= 2
 
-    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
+    atomic_write(metadata_path, json.dumps(metadata, indent=2, sort_keys=True))
 
     sorted_ips = sorted(metadata.keys())
-    feed_path.write_text("\n".join(sorted_ips) + "\n" if sorted_ips else "")
+    atomic_write(feed_path, "\n".join(sorted_ips) + "\n" if sorted_ips else "")
 
     print(f"  [filtered feed] {len(sorted_ips)} malicious+suspicious IPs → {feed_path.name}")
     print(f"  [filtered feed] Metadata → {metadata_path.name}")
@@ -718,12 +728,15 @@ def update_high_confidence_feed(
     feed_path     = feeds_dir / "threat_feed_high_confidence.txt"
 
     if not metadata_path.exists():
-        feed_path.write_text("")
+        atomic_write(feed_path, "")
         return 0
 
     try:
         metadata = json.loads(metadata_path.read_text())
-    except Exception:
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[!] Corrupt file {metadata_path.name}: {exc} — backing up and resetting", file=sys.stderr)
+        corrupt_path = metadata_path.with_suffix(metadata_path.suffix + ".corrupt")
+        metadata_path.rename(corrupt_path)
         metadata = {}
 
     high_confidence = [
@@ -733,7 +746,7 @@ def update_high_confidence_feed(
     ]
 
     sorted_ips = sorted(high_confidence)
-    feed_path.write_text("\n".join(sorted_ips) + "\n" if sorted_ips else "")
+    atomic_write(feed_path, "\n".join(sorted_ips) + "\n" if sorted_ips else "")
 
     print(f"  [high confidence] {len(sorted_ips)} IPs → {feed_path.name}")
     return len(sorted_ips)
@@ -775,7 +788,7 @@ def write_outputs(
         "error":                     error,
     }
     run_log_path = runs_dir / f"{ts_str}_run_log.json"
-    run_log_path.write_text(json.dumps(run_log, indent=2))
+    atomic_write(run_log_path, json.dumps(run_log, indent=2))
     print(f"[+] Run log written: {run_log_path.name}")
 
     if sessions and not bootstrap:
@@ -789,10 +802,10 @@ def write_outputs(
             "sessions":         sessions,
         }
         data_path = data_dir / f"{ts_str}.json"
-        data_path.write_text(json.dumps(data_payload, indent=2))
+        atomic_write(data_path, json.dumps(data_payload, indent=2))
         print(f"[+] Session data written: {data_path.name} ({len(sessions)} sessions)")
     elif bootstrap:
-        print(f"[~] Bootstrap run — skipping session data file to avoid 100MB GitHub limit.")
+        print("[~] Bootstrap run — skipping session data file to avoid 100MB GitHub limit.")
     else:
         print("[~] No sessions found in this window — data file skipped.")
 
@@ -826,7 +839,7 @@ def main() -> None:
         window_end   = now
         window_start = now - timedelta(hours=6)
 
-    print(f"[*] GreyNoise Swarm — sensor activity fetch")
+    print("[*] GreyNoise Swarm — sensor activity fetch")
     print(f"    Sensors   : {len(sensor_map)} — {', '.join(f'{k[:8]}...→{v}' for k, v in sensor_map.items())}")
     print(f"    Workspace : {workspace_id}")
     print(f"    Window    : {window_start.strftime('%Y-%m-%dT%H:%M:%SZ')} → "
@@ -842,7 +855,7 @@ def main() -> None:
     ip_meta: dict  = {}
 
     try:
-        print(f"[*] Fetching all sessions (v1 API)...")
+        print("[*] Fetching all sessions (v1 API)...")
         sessions = fetch_sessions(api_key, workspace_id, window_start, window_end)
 
         print("[*] Updating full threat feed...")
@@ -864,8 +877,11 @@ def main() -> None:
         print("[*] Generating high-confidence feed...")
         hc_count = update_high_confidence_feed(repo_root)
 
-    except SystemExit:
-        raise
+    except SwarmNoiseError as exc:
+        error = str(exc)
+        print(f"[error] {exc}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
     except Exception as exc:
         error = str(exc)
         print(f"[error] Unexpected error: {exc}", file=sys.stderr)

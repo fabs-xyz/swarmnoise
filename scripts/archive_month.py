@@ -195,8 +195,8 @@ def main() -> None:
     print(f"[+] Archive written to archive/{month_str}/")
     print(f"    - filtered_metadata.json  ({len(filtered_metadata)} IPs)")
     print(f"    - ip_metadata.json        ({len(ip_metadata)} IPs)")
-    print(f"    - summary.json")
-    print(f"[*] Done.")
+    print("    - summary.json")
+    print("[*] Done.")
 
 
 if __name__ == "__main__":
